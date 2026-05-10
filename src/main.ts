@@ -8,6 +8,7 @@ import {
   fitToBBox,
   fitToRowGroups,
   onRowGroupClick,
+  onRowGroupHover,
   setFilterRect,
   setHovered,
   setSelected,
@@ -768,6 +769,13 @@ map.on("load", () => {
 onRowGroupClick(map, (indices, lngLat) => {
   if (drawSession || suppressMapClick) return;
   showCandidatePopup(lngLat, indices);
+});
+
+onRowGroupHover(map, (index) => {
+  setHovered(map, index);
+  for (const tr of rgTbody.querySelectorAll<HTMLTableRowElement>("tr")) {
+    tr.classList.toggle("hovered", index !== null && tr.dataset.index === String(index));
+  }
 });
 
 function renderMap() {

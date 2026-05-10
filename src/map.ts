@@ -219,6 +219,27 @@ export function onRowGroupClick(
   });
 }
 
+export function onRowGroupHover(map: MLMap, handler: (index: number | null) => void): void {
+  let current: number | null = null;
+  const update = (next: number | null) => {
+    if (next === current) return;
+    current = next;
+    handler(next);
+  };
+  map.on("mousemove", FILL_LAYER, (e) => {
+    const features = e.features ?? [];
+    let pick: number | null = null;
+    for (const f of features) {
+      const props = f.properties as RowGroupFeatureProps | undefined;
+      if (!props || props.visible === false) continue;
+      pick = props.index;
+      break;
+    }
+    update(pick);
+  });
+  map.on("mouseleave", FILL_LAYER, () => update(null));
+}
+
 let lastSelected: number | null = null;
 export function setSelected(map: MLMap, index: number | null) {
   if (lastSelected !== null) {
