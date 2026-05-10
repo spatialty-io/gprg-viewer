@@ -46,6 +46,7 @@ app.innerHTML = `
     <div id="map"></div>
   </main>
   <section class="bottom">
+    <div class="file-stats" id="file-stats" hidden></div>
     <div class="controls">
       <button id="show-all" type="button">Show all</button>
       <button id="hide-all" type="button">Hide all</button>
@@ -104,6 +105,9 @@ app.innerHTML = `
       </div>
     </div>
   </section>
+  <div class="drop-overlay" id="drop-overlay" hidden>
+    <div class="drop-overlay-inner">Drop GeoParquet file to open</div>
+  </div>
 `;
 
 const mapContainer = document.querySelector<HTMLDivElement>("#map")!;
@@ -129,6 +133,8 @@ const filterInfo = document.querySelector<HTMLSpanElement>("#filter-info")!;
 const clearSelBtn = document.querySelector<HTMLButtonElement>("#clear-sel")!;
 const filterList = document.querySelector<HTMLDivElement>("#filter-list")!;
 const addColFilterBtn = document.querySelector<HTMLButtonElement>("#add-col-filter")!;
+const fileStatsEl = document.querySelector<HTMLDivElement>("#file-stats")!;
+const dropOverlay = document.querySelector<HTMLDivElement>("#drop-overlay")!;
 
 let current: GeoParquetInfo | null = null;
 let selectedIndex: number | null = null;
@@ -200,15 +206,51 @@ function onLoaded(info: GeoParquetInfo, label: string) {
   toggleAllEl.checked = true;
   toggleAllEl.indeterminate = false;
   clearSelBtn.hidden = true;
+  renderFileStats(info, label);
   renderRowGroupTable(info);
   renderColumnTable(null);
   renderMap();
   setSelected(map, null);
   fitToRowGroups(map, info.rowGroups);
-  const withBbox = info.rowGroups.filter((r) => r.bbox).length;
-  const total = info.rowGroups.length;
   const warnSuffix = info.warnings.length ? ` · ${info.warnings.length} warning(s)` : "";
-  setStatus(`Loaded ${label}: ${total} row group(s), ${withBbox} with bbox${warnSuffix}.`);
+  setStatus(`Loaded ${label}${warnSuffix}.`);
+}
+
+function renderFileStats(info: GeoParquetInfo, label: string) {
+  const totalRows = info.rowGroups.reduce((s, r) => s + r.numRows, 0);
+  const compressed = info.rowGroups.reduce((s, r) => s + r.totalCompressedBytes, 0);
+  const uncompressed = info.rowGroups.reduce((s, r) => s + r.totalUncompressedBytes, 0);
+  const ratio = compressed > 0 ? uncompressed / compressed : 0;
+  const columnCount = info.rowGroups[0]?.columns.length ?? 0;
+
+  const stats: Array<[string, string, string?]> = [
+    ["Source", label, label],
+    ["File size", info.fileSize !== null ? formatBytes(info.fileSize) : "—"],
+    ["Row groups", info.rowGroups.length.toLocaleString()],
+    ["Rows", totalRows.toLocaleString()],
+    ["Columns", columnCount.toLocaleString()],
+    ["Compressed", `${formatBytes(compressed)}${ratio > 0 ? ` (${ratio.toFixed(2)}× ratio)` : ""}`],
+    ["Uncompressed", formatBytes(uncompressed)],
+  ];
+  if (info.geoVersion) stats.push(["GeoParquet", info.geoVersion]);
+  if (info.primaryColumn) stats.push(["Geometry", info.primaryColumn]);
+  if (info.crs) stats.push(["CRS", info.crs]);
+
+  fileStatsEl.innerHTML = "";
+  for (const [k, v, title] of stats) {
+    const item = document.createElement("div");
+    item.className = "stat";
+    const key = document.createElement("span");
+    key.className = "stat-key";
+    key.textContent = k;
+    const val = document.createElement("span");
+    val.className = "stat-val";
+    val.textContent = v;
+    if (title) val.title = title;
+    item.append(key, val);
+    fileStatsEl.appendChild(item);
+  }
+  fileStatsEl.hidden = false;
 }
 
 function visibleRowGroups(info: GeoParquetInfo): RowGroupInfo[] {
@@ -819,6 +861,35 @@ fileInput.addEventListener("change", () => {
   const f = fileInput.files?.[0];
   if (f) void handleFile(f);
   fileInput.value = "";
+});
+
+let dragDepth = 0;
+function isFileDrag(e: DragEvent): boolean {
+  return Array.from(e.dataTransfer?.types ?? []).includes("Files");
+}
+window.addEventListener("dragenter", (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  dragDepth++;
+  dropOverlay.hidden = false;
+});
+window.addEventListener("dragover", (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+});
+window.addEventListener("dragleave", (e) => {
+  if (!isFileDrag(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) dropOverlay.hidden = true;
+});
+window.addEventListener("drop", (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  dropOverlay.hidden = true;
+  const file = e.dataTransfer?.files?.[0];
+  if (file) void handleFile(file);
 });
 toggleAllEl.addEventListener("change", () => {
   setAllVisibility(toggleAllEl.checked);

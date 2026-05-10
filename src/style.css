@@ -114,8 +114,43 @@ section.bottom {
   border-top: 1px solid var(--border);
   background: var(--panel);
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+section.bottom .file-stats:not([hidden]) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+  padding: 0.4rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 0.78rem;
+}
+
+section.bottom .file-stats .stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+section.bottom .file-stats .stat-key {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.7rem;
+}
+
+section.bottom .file-stats .stat-val {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 36ch;
 }
 
 section.bottom .controls {
@@ -227,9 +262,10 @@ section.bottom .filter-chip button.remove:hover {
 section.bottom .panes {
   display: flex;
   min-height: 0;
+  min-width: 0;
 }
 
-section.bottom .pane {
+section.bottom .pane:not([hidden]) {
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -469,6 +505,29 @@ table.rg td .muted {
   color: var(--muted);
   white-space: nowrap;
   overflow-x: auto;
+}
+
+.drop-overlay:not([hidden]) {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 17, 21, 0.55);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+}
+
+.drop-overlay-inner {
+  padding: 1.2rem 1.8rem;
+  border: 2px dashed var(--accent);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--fg);
+  font-size: 1rem;
+  font-weight: 600;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 
 @media (prefers-color-scheme: light) {

@@ -31,7 +31,11 @@ export function createMap(container: HTMLElement): MLMap {
     center: [0, 0],
     zoom: 1,
     renderWorldCopies: false,
-    attributionControl: { compact: true },
+    attributionControl: {
+      compact: true,
+      customAttribution:
+        'by <a href="https://spatialty.io" target="_blank" rel="noopener noreferrer">spatialty</a>',
+    },
   });
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }));
   map.addControl(new maplibregl.ScaleControl({ unit: "metric" }));

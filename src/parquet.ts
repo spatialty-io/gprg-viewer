@@ -46,6 +46,7 @@ export interface GeoParquetInfo {
   crs: string | null;
   rowGroups: RowGroupInfo[];
   warnings: string[];
+  fileSize: number | null;
 }
 
 const COVERING_KEYS = ["xmin", "ymin", "xmax", "ymax"] as const;
@@ -70,14 +71,14 @@ export async function loadFromUrl(url: string): Promise<GeoParquetInfo> {
   const raw = await asyncBufferFromUrl({ url });
   const buf = cachedAsyncBuffer(raw, { minSize: 1 << 16 });
   const metadata = await parquetMetadataAsync(buf);
-  return analyze(metadata);
+  return analyze(metadata, raw.byteLength);
 }
 
 export async function loadFromFile(file: File): Promise<GeoParquetInfo> {
   const buf = fileAsAsyncBuffer(file);
   // Try the async path first; fall back to whole-file read for very small files.
   const metadata = await parquetMetadataAsync(buf);
-  return analyze(metadata);
+  return analyze(metadata, file.size);
 }
 
 function fileAsAsyncBuffer(file: File): AsyncBuffer {
@@ -90,7 +91,7 @@ function fileAsAsyncBuffer(file: File): AsyncBuffer {
   };
 }
 
-export function analyze(metadata: FileMetaData): GeoParquetInfo {
+export function analyze(metadata: FileMetaData, fileSize: number | null = null): GeoParquetInfo {
   const warnings: string[] = [];
   const geo = readGeoMetadata(metadata);
 
@@ -133,6 +134,7 @@ export function analyze(metadata: FileMetaData): GeoParquetInfo {
     crs,
     rowGroups,
     warnings,
+    fileSize,
   };
 }
 
