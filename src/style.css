@@ -100,6 +100,21 @@ header.toolbar .status.error {
   color: var(--danger);
 }
 
+header.toolbar .repo-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0.3rem;
+  border-radius: 6px;
+}
+
+header.toolbar .repo-link:hover {
+  color: var(--fg);
+  background: var(--panel-2);
+}
+
 main {
   position: relative;
   min-height: 0;
