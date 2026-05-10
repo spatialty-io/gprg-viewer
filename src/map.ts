@@ -27,7 +27,25 @@ export function colorFor(index: number): string {
 export function createMap(container: HTMLElement): MLMap {
   const map = new maplibregl.Map({
     container,
-    style: "https://demotiles.maplibre.org/style.json",
+    style: {
+      version: 8,
+      sources: {
+        "raster-tiles": {
+          type: "raster",
+          tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+          tileSize: 256,
+          attribution:
+            '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors',
+        },
+      },
+      layers: [
+        {
+          id: "osm-tiles",
+          type: "raster",
+          source: "raster-tiles",
+        },
+      ],
+    },
     center: [0, 0],
     zoom: 1,
     renderWorldCopies: false,
@@ -40,6 +58,7 @@ export function createMap(container: HTMLElement): MLMap {
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }));
   map.addControl(new maplibregl.ScaleControl({ unit: "metric" }));
   map.addControl(new ProjectionControl(), "top-right");
+  map.showTileBoundaries = true;
   return map;
 }
 
