@@ -319,7 +319,8 @@ table.rg tbody td {
   vertical-align: top;
 }
 
-table.rg tbody tr:hover {
+table.rg tbody tr:hover,
+table.rg tbody tr.hovered {
   background: rgba(79, 140, 255, 0.08);
   cursor: pointer;
 }
