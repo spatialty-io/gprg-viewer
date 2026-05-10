@@ -58,12 +58,13 @@ export function createMap(container: HTMLElement): MLMap {
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }));
   map.addControl(new maplibregl.ScaleControl({ unit: "metric" }));
   map.addControl(new ProjectionControl(), "top-right");
-  map.showTileBoundaries = true;
+  map.addControl(new TileBoundariesControl(true), "top-right");
   return map;
 }
 
 const GLOBE_ICON = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></svg>`;
 const MAP_ICON = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6l6-2 6 2 6-2v14l-6 2-6-2-6 2z"/><path d="M9 4v16"/><path d="M15 6v16"/></svg>`;
+const GRID_ICON = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/></svg>`;
 
 export class ProjectionControl implements maplibregl.IControl {
   private mapRef: MLMap | null = null;
@@ -107,6 +108,56 @@ export class ProjectionControl implements maplibregl.IControl {
     this.button.innerHTML = this.isGlobe ? MAP_ICON : GLOBE_ICON;
     this.button.classList.toggle("active", this.isGlobe);
     this.applyLabel(this.button, this.isGlobe);
+  }
+}
+
+export class TileBoundariesControl implements maplibregl.IControl {
+  private mapRef: MLMap | null = null;
+  private container: HTMLDivElement | null = null;
+  private button: HTMLButtonElement | null = null;
+  private enabled: boolean;
+
+  constructor(initialEnabled = false) {
+    this.enabled = initialEnabled;
+  }
+
+  onAdd(map: MLMap): HTMLElement {
+    this.mapRef = map;
+    map.showTileBoundaries = this.enabled;
+    const container = document.createElement("div");
+    container.className = "maplibregl-ctrl maplibregl-ctrl-group projection-ctrl";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "projection-ctrl-button";
+    button.innerHTML = GRID_ICON;
+    button.classList.toggle("active", this.enabled);
+    this.applyLabel(button, this.enabled);
+    button.addEventListener("click", () => this.toggle());
+    container.appendChild(button);
+    this.container = container;
+    this.button = button;
+    return container;
+  }
+
+  onRemove(): void {
+    this.container?.parentNode?.removeChild(this.container);
+    this.mapRef = null;
+    this.container = null;
+    this.button = null;
+  }
+
+  private applyLabel(button: HTMLButtonElement, enabled: boolean): void {
+    const label = enabled ? "Hide tile boundaries" : "Show tile boundaries";
+    button.title = label;
+    button.setAttribute("aria-label", label);
+  }
+
+  private toggle(): void {
+    if (!this.mapRef || !this.button) return;
+    this.enabled = !this.enabled;
+    this.mapRef.showTileBoundaries = this.enabled;
+    this.button.classList.toggle("active", this.enabled);
+    this.applyLabel(this.button, this.enabled);
   }
 }
 
