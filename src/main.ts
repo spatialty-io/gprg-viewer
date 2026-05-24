@@ -16,7 +16,7 @@ import {
   updateFeatures,
 } from "./map.ts";
 import { formatBBox, formatBytes, loadFromFile, loadFromUrl } from "./parquet.ts";
-import type { BBox, ColumnStats, GeoParquetInfo, RowGroupInfo } from "./parquet.ts";
+import type { BBox, ColumnStats, GeoParquetInfo, KeyValueEntry, RowGroupInfo } from "./parquet.ts";
 import { FILTER_OPS, makeId, rowGroupMatchesFilters } from "./filter.ts";
 import type { ColumnFilter, FilterOp } from "./filter.ts";
 import maplibregl from "maplibre-gl";
@@ -60,6 +60,10 @@ app.innerHTML = `
   </main>
   <section class="bottom">
     <div class="file-stats" id="file-stats" hidden></div>
+    <details class="kv-meta" id="kv-meta" hidden>
+      <summary><span class="kv-meta-label">Parquet key/value metadata</span> <span class="kv-meta-count" id="kv-meta-count"></span></summary>
+      <div class="kv-meta-list" id="kv-meta-list"></div>
+    </details>
     <div class="controls">
       <button id="show-all" type="button">Show all</button>
       <button id="hide-all" type="button">Hide all</button>
@@ -147,6 +151,9 @@ const clearSelBtn = document.querySelector<HTMLButtonElement>("#clear-sel")!;
 const filterList = document.querySelector<HTMLDivElement>("#filter-list")!;
 const addColFilterBtn = document.querySelector<HTMLButtonElement>("#add-col-filter")!;
 const fileStatsEl = document.querySelector<HTMLDivElement>("#file-stats")!;
+const kvMetaEl = document.querySelector<HTMLDetailsElement>("#kv-meta")!;
+const kvMetaListEl = document.querySelector<HTMLDivElement>("#kv-meta-list")!;
+const kvMetaCountEl = document.querySelector<HTMLSpanElement>("#kv-meta-count")!;
 const dropOverlay = document.querySelector<HTMLDivElement>("#drop-overlay")!;
 
 let current: GeoParquetInfo | null = null;
@@ -220,6 +227,7 @@ function onLoaded(info: GeoParquetInfo, label: string) {
   toggleAllEl.indeterminate = false;
   clearSelBtn.hidden = true;
   renderFileStats(info, label);
+  renderKeyValueMetadata(info.keyValueMetadata);
   renderRowGroupTable(info);
   renderColumnTable(null);
   renderMap();
@@ -239,6 +247,9 @@ function renderFileStats(info: GeoParquetInfo, label: string) {
   const stats: Array<[string, string, string?]> = [
     ["Source", label, label],
     ["File size", info.fileSize !== null ? formatBytes(info.fileSize) : "—"],
+    ["Parquet version", String(info.parquetVersion)],
+    ["Footer", info.metadataLength !== null ? formatBytes(info.metadataLength) : "—"],
+    ["Writer", info.createdBy ?? "—", info.createdBy ?? undefined],
     ["Row groups", info.rowGroups.length.toLocaleString()],
     ["Rows", totalRows.toLocaleString()],
     ["Columns", columnCount.toLocaleString()],
@@ -264,6 +275,54 @@ function renderFileStats(info: GeoParquetInfo, label: string) {
     fileStatsEl.appendChild(item);
   }
   fileStatsEl.hidden = false;
+}
+
+function renderKeyValueMetadata(entries: KeyValueEntry[]) {
+  kvMetaListEl.innerHTML = "";
+  if (entries.length === 0) {
+    kvMetaEl.hidden = true;
+    kvMetaEl.open = false;
+    return;
+  }
+  kvMetaEl.hidden = false;
+  kvMetaCountEl.textContent = `${entries.length} entr${entries.length === 1 ? "y" : "ies"}`;
+  for (const entry of entries) {
+    kvMetaListEl.appendChild(buildKeyValueItem(entry));
+  }
+}
+
+function buildKeyValueItem(entry: KeyValueEntry): HTMLElement {
+  const item = document.createElement("div");
+  item.className = "kv-meta-item";
+
+  const keyEl = document.createElement("div");
+  keyEl.className = "kv-meta-key";
+  keyEl.textContent = entry.key;
+  item.appendChild(keyEl);
+
+  const pre = document.createElement("pre");
+  pre.className = "kv-meta-value mono";
+  pre.textContent = formatKeyValue(entry.value);
+  item.appendChild(pre);
+
+  return item;
+}
+
+function formatKeyValue(value: string | null): string {
+  if (value === null) return "(null)";
+  if (value === "") return "(empty)";
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  ) {
+    try {
+      return JSON.stringify(JSON.parse(trimmed), null, 2);
+    } catch {
+      // fall through
+    }
+  }
+  return value;
 }
 
 function visibleRowGroups(info: GeoParquetInfo): RowGroupInfo[] {
