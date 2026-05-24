@@ -39,6 +39,11 @@ export interface RowGroupInfo {
   columns: ColumnStats[];
 }
 
+export interface KeyValueEntry {
+  key: string;
+  value: string | null;
+}
+
 export interface GeoParquetInfo {
   metadata: FileMetaData;
   primaryColumn: string | null;
@@ -47,6 +52,10 @@ export interface GeoParquetInfo {
   rowGroups: RowGroupInfo[];
   warnings: string[];
   fileSize: number | null;
+  parquetVersion: number;
+  createdBy: string | null;
+  metadataLength: number | null;
+  keyValueMetadata: KeyValueEntry[];
 }
 
 const COVERING_KEYS = ["xmin", "ymin", "xmax", "ymax"] as const;
@@ -127,6 +136,11 @@ export function analyze(metadata: FileMetaData, fileSize: number | null = null):
     summarizeRowGroup(rg, i, primaryColumn, coveringPaths),
   );
 
+  const keyValueMetadata: KeyValueEntry[] = (metadata.key_value_metadata ?? []).map((kv) => ({
+    key: kv.key,
+    value: kv.value ?? null,
+  }));
+
   return {
     metadata,
     primaryColumn,
@@ -135,6 +149,10 @@ export function analyze(metadata: FileMetaData, fileSize: number | null = null):
     rowGroups,
     warnings,
     fileSize,
+    parquetVersion: metadata.version,
+    createdBy: metadata.created_by ?? null,
+    metadataLength: typeof metadata.metadata_length === "number" ? metadata.metadata_length : null,
+    keyValueMetadata,
   };
 }
 

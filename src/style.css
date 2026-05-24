@@ -129,7 +129,7 @@ section.bottom {
   border-top: 1px solid var(--border);
   background: var(--panel);
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   min-height: 0;
   min-width: 0;
   overflow: hidden;
@@ -166,6 +166,93 @@ section.bottom .file-stats .stat-val {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 36ch;
+}
+
+section.bottom .kv-meta:not([hidden]) {
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 0.78rem;
+  max-height: 40vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+section.bottom .kv-meta summary {
+  cursor: pointer;
+  padding: 0.4rem 0.9rem;
+  color: var(--muted);
+  list-style: none;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+section.bottom .kv-meta summary::before {
+  content: "▸";
+  font-size: 0.7rem;
+  color: var(--muted);
+  transition: transform 0.15s;
+  display: inline-block;
+}
+
+section.bottom .kv-meta[open] summary::before {
+  transform: rotate(90deg);
+}
+
+section.bottom .kv-meta summary::-webkit-details-marker {
+  display: none;
+}
+
+section.bottom .kv-meta .kv-meta-label {
+  color: var(--fg);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+section.bottom .kv-meta .kv-meta-count {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+section.bottom .kv-meta-list {
+  padding: 0 0.9rem 0.6rem;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+section.bottom .kv-meta-item {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 0;
+}
+
+section.bottom .kv-meta-key {
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  word-break: break-all;
+}
+
+section.bottom .kv-meta-value {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  color: var(--fg);
+  white-space: pre;
+  overflow: auto;
+  max-height: 18rem;
+  padding: 0;
 }
 
 section.bottom .controls {
