@@ -6,6 +6,11 @@ import type { BBox, RowGroupInfo } from "./parquet.ts";
 const SOURCE_ID = "rowgroups";
 const FILL_LAYER = "rowgroups-fill";
 const LINE_LAYER = "rowgroups-line";
+const PAGE_SOURCE_ID = "page-bboxes";
+const PAGE_FILL_LAYER = "page-bboxes-fill";
+const PAGE_HALO_LAYER = "page-bboxes-halo";
+const PAGE_LINE_LAYER = "page-bboxes-line";
+const PAGE_COLOR = "#ffea00";
 
 const PALETTE = [
   "#4f8cff",
@@ -259,6 +264,58 @@ export function ensureLayers(map: MLMap, fc: GeoJSON.FeatureCollection) {
 export function updateFeatures(map: MLMap, fc: GeoJSON.FeatureCollection) {
   const src = map.getSource(SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
   if (src) src.setData(fc);
+}
+
+export function setPageBboxes(map: MLMap, bboxes: BBox[]) {
+  if (bboxes.length === 0) {
+    if (map.getLayer(PAGE_LINE_LAYER)) map.removeLayer(PAGE_LINE_LAYER);
+    if (map.getLayer(PAGE_HALO_LAYER)) map.removeLayer(PAGE_HALO_LAYER);
+    if (map.getLayer(PAGE_FILL_LAYER)) map.removeLayer(PAGE_FILL_LAYER);
+    if (map.getSource(PAGE_SOURCE_ID)) map.removeSource(PAGE_SOURCE_ID);
+    return;
+  }
+  const data: GeoJSON.FeatureCollection<GeoJSON.Polygon> = {
+    type: "FeatureCollection",
+    features: bboxes.map((bbox, pageIndex) => ({
+      type: "Feature",
+      id: pageIndex,
+      geometry: bboxToPolygon(bbox),
+      properties: { pageIndex },
+    })),
+  };
+  const source = map.getSource(PAGE_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+  if (source) {
+    source.setData(data);
+    return;
+  }
+  map.addSource(PAGE_SOURCE_ID, { type: "geojson", data });
+  map.addLayer({
+    id: PAGE_FILL_LAYER,
+    type: "fill",
+    source: PAGE_SOURCE_ID,
+    paint: { "fill-color": PAGE_COLOR, "fill-opacity": 0.14 },
+  });
+  map.addLayer({
+    id: PAGE_HALO_LAYER,
+    type: "line",
+    source: PAGE_SOURCE_ID,
+    paint: {
+      "line-color": "#111827",
+      "line-width": 6,
+      "line-opacity": 0.85,
+    },
+  });
+  map.addLayer({
+    id: PAGE_LINE_LAYER,
+    type: "line",
+    source: PAGE_SOURCE_ID,
+    paint: {
+      "line-color": PAGE_COLOR,
+      "line-width": 3,
+      "line-opacity": 1,
+      "line-dasharray": [2, 1],
+    },
+  });
 }
 
 export function onRowGroupClick(

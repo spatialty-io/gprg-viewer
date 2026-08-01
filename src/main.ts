@@ -11,6 +11,7 @@ import {
   onRowGroupHover,
   setFilterRect,
   setHovered,
+  setPageBboxes,
   setSelected,
   startDrawRectangle,
   updateFeatures,
@@ -232,6 +233,7 @@ function onLoaded(info: GeoParquetInfo, label: string) {
   renderColumnTable(null);
   renderMap();
   setSelected(map, null);
+  setPageBboxes(map, []);
   fitToRowGroups(map, info.rowGroups);
   const warnSuffix = info.warnings.length ? ` · ${info.warnings.length} warning(s)` : "";
   setStatus(`Loaded ${label}${warnSuffix}.`);
@@ -616,7 +618,7 @@ function renderColumnTable(rg: RowGroupInfo | null) {
     return;
   }
   colPane.hidden = false;
-  colHeader.textContent = `Row group #${rg.index} · ${rg.columns.length} column${rg.columns.length === 1 ? "" : "s"}`;
+  renderColumnHeader(rg);
   if (rg.columns.length === 0) {
     colTable.hidden = true;
     colEmpty.hidden = false;
@@ -628,6 +630,11 @@ function renderColumnTable(rg: RowGroupInfo | null) {
   for (const col of rg.columns) {
     colTbody.appendChild(buildColumnRow(col));
   }
+}
+
+function renderColumnHeader(rg: RowGroupInfo, pageIndexStatus?: string) {
+  const suffix = pageIndexStatus ? ` · ${pageIndexStatus}` : "";
+  colHeader.textContent = `Row group #${rg.index} · ${rg.columns.length} column${rg.columns.length === 1 ? "" : "s"}${suffix}`;
 }
 
 function buildColumnRow(col: ColumnStats): HTMLTableRowElement {
@@ -714,9 +721,33 @@ function onRowSelect(rg: RowGroupInfo, options: { fit?: boolean } = { fit: true 
     tr.classList.toggle("selected", tr.dataset.index === String(rg.index));
   }
   setSelected(map, rg.bbox ? rg.index : null);
+  setPageBboxes(map, []);
   renderColumnTable(rg);
+  renderColumnHeader(rg, "Loading Page Index…");
   if (rg.bbox && options.fit !== false) fitToBBox(map, rg.bbox);
   clearSelBtn.hidden = false;
+  void showPageBboxes(rg);
+}
+
+async function showPageBboxes(rg: RowGroupInfo) {
+  if (!current) return;
+  const info = current;
+  try {
+    const bboxes = await info.loadPageBboxes(rg.index);
+    if (current !== info || selectedIndex !== rg.index) return;
+    setPageBboxes(map, bboxes);
+    renderColumnHeader(
+      rg,
+      bboxes.length === 0
+        ? "Page Index bbox unavailable"
+        : `${bboxes.length.toLocaleString()} Page Index bbox${bboxes.length === 1 ? "" : "es"}`,
+    );
+  } catch (err) {
+    if (current !== info || selectedIndex !== rg.index) return;
+    setPageBboxes(map, []);
+    renderColumnHeader(rg, "Page Index read failed");
+    setStatus(`Failed to read Page Index: ${formatError(err)}`, "error");
+  }
 }
 
 function clearSelection() {
@@ -725,6 +756,7 @@ function clearSelection() {
     tr.classList.remove("selected");
   }
   setSelected(map, null);
+  setPageBboxes(map, []);
   renderColumnTable(null);
   clearSelBtn.hidden = true;
 }

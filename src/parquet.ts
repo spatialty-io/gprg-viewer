@@ -1,5 +1,20 @@
-import { asyncBufferFromUrl, cachedAsyncBuffer, parquetMetadataAsync } from "hyparquet";
-import type { AsyncBuffer, ColumnChunk, FileMetaData, RowGroup, Statistics } from "hyparquet";
+import {
+  asyncBufferFromUrl,
+  cachedAsyncBuffer,
+  parquetMetadataAsync,
+  readColumnIndex,
+  readOffsetIndex,
+} from "hyparquet";
+import type {
+  AsyncBuffer,
+  ColumnChunk,
+  ColumnIndex,
+  FileMetaData,
+  OffsetIndex,
+  RowGroup,
+  SchemaElement,
+  Statistics,
+} from "hyparquet";
 
 export interface BBox {
   xmin: number;
@@ -56,6 +71,7 @@ export interface GeoParquetInfo {
   createdBy: string | null;
   metadataLength: number | null;
   keyValueMetadata: KeyValueEntry[];
+  loadPageBboxes(rowGroupIndex: number): Promise<BBox[]>;
 }
 
 const COVERING_KEYS = ["xmin", "ymin", "xmax", "ymax"] as const;
@@ -80,14 +96,14 @@ export async function loadFromUrl(url: string): Promise<GeoParquetInfo> {
   const raw = await asyncBufferFromUrl({ url });
   const buf = cachedAsyncBuffer(raw, { minSize: 1 << 16 });
   const metadata = await parquetMetadataAsync(buf);
-  return analyze(metadata, raw.byteLength);
+  return analyze(metadata, raw.byteLength, buf);
 }
 
 export async function loadFromFile(file: File): Promise<GeoParquetInfo> {
   const buf = fileAsAsyncBuffer(file);
   // Try the async path first; fall back to whole-file read for very small files.
   const metadata = await parquetMetadataAsync(buf);
-  return analyze(metadata, file.size);
+  return analyze(metadata, file.size, buf);
 }
 
 function fileAsAsyncBuffer(file: File): AsyncBuffer {
@@ -100,7 +116,11 @@ function fileAsAsyncBuffer(file: File): AsyncBuffer {
   };
 }
 
-export function analyze(metadata: FileMetaData, fileSize: number | null = null): GeoParquetInfo {
+export function analyze(
+  metadata: FileMetaData,
+  fileSize: number | null = null,
+  file: AsyncBuffer | null = null,
+): GeoParquetInfo {
   const warnings: string[] = [];
   const geo = readGeoMetadata(metadata);
 
@@ -153,7 +173,130 @@ export function analyze(metadata: FileMetaData, fileSize: number | null = null):
     createdBy: metadata.created_by ?? null,
     metadataLength: typeof metadata.metadata_length === "number" ? metadata.metadata_length : null,
     keyValueMetadata,
+    loadPageBboxes: createPageBboxLoader(file, metadata, coveringPaths),
   };
+}
+
+function createPageBboxLoader(
+  file: AsyncBuffer | null,
+  metadata: FileMetaData,
+  coveringPaths: CoveringPaths | null,
+): (rowGroupIndex: number) => Promise<BBox[]> {
+  const cache = new Map<number, Promise<BBox[]>>();
+  return (rowGroupIndex) => {
+    if (!file || !coveringPaths) return Promise.resolve([]);
+    const cached = cache.get(rowGroupIndex);
+    if (cached) return cached;
+    const pending = readPageBboxes(file, metadata, rowGroupIndex, coveringPaths);
+    cache.set(rowGroupIndex, pending);
+    void pending.catch(() => cache.delete(rowGroupIndex));
+    return pending;
+  };
+}
+
+interface IndexedPages {
+  columnIndex: ColumnIndex;
+  offsetIndex: OffsetIndex;
+}
+
+async function readPageBboxes(
+  file: AsyncBuffer,
+  metadata: FileMetaData,
+  rowGroupIndex: number,
+  paths: CoveringPaths,
+): Promise<BBox[]> {
+  const rowGroup = metadata.row_groups[rowGroupIndex];
+  if (!rowGroup) return [];
+  const leafSchema = metadata.schema.filter(
+    (element): element is SchemaElement & { type: NonNullable<SchemaElement["type"]> } =>
+      element.type !== undefined,
+  );
+
+  const indexes = await Promise.all(
+    COVERING_KEYS.map(async (key): Promise<IndexedPages | null> => {
+      const columnIndex = rowGroup.columns.findIndex((column) =>
+        pathEquals(column.meta_data?.path_in_schema, paths[key]),
+      );
+      if (columnIndex < 0) return null;
+      const column = rowGroup.columns[columnIndex];
+      const schema = leafSchema[columnIndex];
+      if (
+        !schema ||
+        column.column_index_offset === undefined ||
+        column.column_index_length === undefined ||
+        column.offset_index_offset === undefined ||
+        column.offset_index_length === undefined
+      ) {
+        return null;
+      }
+      const [columnBuffer, offsetBuffer] = await Promise.all([
+        file.slice(
+          Number(column.column_index_offset),
+          Number(column.column_index_offset) + column.column_index_length,
+        ),
+        file.slice(
+          Number(column.offset_index_offset),
+          Number(column.offset_index_offset) + column.offset_index_length,
+        ),
+      ]);
+      return {
+        columnIndex: readColumnIndex({ view: new DataView(columnBuffer), offset: 0 }, schema),
+        offsetIndex: readOffsetIndex({ view: new DataView(offsetBuffer), offset: 0 }),
+      };
+    }),
+  );
+  if (indexes.some((index) => index === null)) return [];
+
+  // Columns can choose different page boundaries. Split at every boundary and
+  // use the containing page's bounds so each resulting bbox covers one shared
+  // row interval without assuming that the four covering columns are aligned.
+  const complete = indexes as IndexedPages[];
+  const boundaries = new Set<number>([0, Number(rowGroup.num_rows)]);
+  for (const index of complete) {
+    for (const page of index.offsetIndex.page_locations) {
+      boundaries.add(Number(page.first_row_index));
+    }
+  }
+  const starts = [...boundaries]
+    .filter((value) => value >= 0 && value < Number(rowGroup.num_rows))
+    .sort((a, b) => a - b);
+  const pagePointers = [0, 0, 0, 0];
+  const bboxes: BBox[] = [];
+  for (const rowStart of starts) {
+    const values: number[] = [];
+    for (let keyIndex = 0; keyIndex < complete.length; keyIndex++) {
+      const index = complete[keyIndex];
+      const locations = index.offsetIndex.page_locations;
+      while (
+        pagePointers[keyIndex] + 1 < locations.length &&
+        Number(locations[pagePointers[keyIndex] + 1].first_row_index) <= rowStart
+      ) {
+        pagePointers[keyIndex]++;
+      }
+      const pageIndex = pagePointers[keyIndex];
+      if (index.columnIndex.null_pages[pageIndex]) break;
+      const raw =
+        keyIndex < 2
+          ? index.columnIndex.min_values[pageIndex]
+          : index.columnIndex.max_values[pageIndex];
+      const value = numericIndexValue(raw);
+      if (value === null) break;
+      values.push(value);
+    }
+    if (values.length !== 4) continue;
+    const [xmin, ymin, xmax, ymax] = values;
+    if (xmin <= xmax && ymin <= ymax) bboxes.push({ xmin, ymin, xmax, ymax });
+  }
+  return bboxes;
+}
+
+function numericIndexValue(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "bigint") {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+  return null;
 }
 
 function readGeoMetadata(metadata: FileMetaData): GeoMetadata | null {
