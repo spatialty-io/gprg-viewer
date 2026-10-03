@@ -1,7 +1,6 @@
 import maplibregl, { Map as MLMap } from "maplibre-gl";
-import type { MapMouseEvent } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import type { BBox, RowGroupInfo } from "./parquet.ts";
+import type { BBox } from "./parquet.ts";
 
 const SOURCE_ID = "rowgroups";
 const FILL_LAYER = "rowgroups-fill";
@@ -181,31 +180,38 @@ function bboxToPolygon(b: BBox): GeoJSON.Polygon {
   };
 }
 
+export type RowGroupState = "active" | "hit" | "dim" | "hidden";
+
+export interface RowGroupFeature {
+  index: number;
+  /** Longitude/latitude bbox. */
+  bbox: BBox;
+  color: string;
+  state: RowGroupState;
+}
+
 export interface RowGroupFeatureProps {
   index: number;
   color: string;
-  visible: boolean;
+  state: RowGroupState;
 }
 
 export function buildFeatureCollection(
-  rowGroups: RowGroupInfo[],
-  visibility: Map<number, boolean>,
+  items: RowGroupFeature[],
 ): GeoJSON.FeatureCollection<GeoJSON.Polygon, RowGroupFeatureProps> {
-  const features: GeoJSON.Feature<GeoJSON.Polygon, RowGroupFeatureProps>[] = [];
-  for (const rg of rowGroups) {
-    if (!rg.bbox) continue;
-    features.push({
-      type: "Feature",
-      id: rg.index,
-      geometry: bboxToPolygon(rg.bbox),
-      properties: {
-        index: rg.index,
-        color: colorFor(rg.index),
-        visible: visibility.get(rg.index) ?? true,
-      },
-    });
-  }
-  return { type: "FeatureCollection", features };
+  return {
+    type: "FeatureCollection",
+    // Draw coarse row groups last so they stay on top of finer, smaller ones.
+    features: items
+      .filter((item) => item.state !== "hidden")
+      .reverse()
+      .map((item) => ({
+        type: "Feature",
+        id: item.index,
+        geometry: bboxToPolygon(item.bbox),
+        properties: { index: item.index, color: item.color, state: item.state },
+      })),
+  };
 }
 
 export function ensureLayers(map: MLMap, fc: GeoJSON.FeatureCollection) {
@@ -224,12 +230,10 @@ export function ensureLayers(map: MLMap, fc: GeoJSON.FeatureCollection) {
       "fill-opacity": [
         "case",
         ["boolean", ["feature-state", "selected"], false],
-        0.6,
+        0.55,
         ["boolean", ["feature-state", "hovered"], false],
         0.45,
-        ["get", "visible"],
-        0.12,
-        0,
+        ["match", ["get", "state"], "hit", 0.3, "active", 0.1, 0.02],
       ],
     },
   });
@@ -245,7 +249,7 @@ export function ensureLayers(map: MLMap, fc: GeoJSON.FeatureCollection) {
         5,
         ["boolean", ["feature-state", "hovered"], false],
         4,
-        1.4,
+        ["match", ["get", "state"], "hit", 2.2, 1.2],
       ],
       "line-opacity": [
         "case",
@@ -253,9 +257,7 @@ export function ensureLayers(map: MLMap, fc: GeoJSON.FeatureCollection) {
         1,
         ["boolean", ["feature-state", "hovered"], false],
         1,
-        ["get", "visible"],
-        0.9,
-        0,
+        ["match", ["get", "state"], "dim", 0.2, 0.9],
       ],
     },
   });
@@ -328,7 +330,7 @@ export function onRowGroupClick(
     const indices: number[] = [];
     for (const f of features) {
       const props = f.properties as RowGroupFeatureProps | undefined;
-      if (!props || props.visible === false) continue;
+      if (!props || props.state === "dim") continue;
       if (seen.has(props.index)) continue;
       seen.add(props.index);
       indices.push(props.index);
@@ -358,7 +360,7 @@ export function onRowGroupHover(map: MLMap, handler: (index: number | null) => v
     let pick: number | null = null;
     for (const f of features) {
       const props = f.properties as RowGroupFeatureProps | undefined;
-      if (!props || props.visible === false) continue;
+      if (!props || props.state === "dim") continue;
       pick = props.index;
       break;
     }
@@ -406,170 +408,3 @@ export function fitToBBox(map: MLMap, b: BBox, padding = 40) {
   );
 }
 
-export function fitToRowGroups(map: MLMap, rowGroups: RowGroupInfo[]) {
-  const valid = rowGroups.filter((r) => r.bbox);
-  if (valid.length === 0) return;
-  let xmin = Infinity,
-    ymin = Infinity,
-    xmax = -Infinity,
-    ymax = -Infinity;
-  for (const r of valid) {
-    const b = r.bbox!;
-    if (b.xmin < xmin) xmin = b.xmin;
-    if (b.ymin < ymin) ymin = b.ymin;
-    if (b.xmax > xmax) xmax = b.xmax;
-    if (b.ymax > ymax) ymax = b.ymax;
-  }
-  fitToBBox(map, { xmin, ymin, xmax, ymax }, 60);
-}
-
-const FILTER_SOURCE = "filter-rect";
-const FILTER_FILL = "filter-rect-fill";
-const FILTER_LINE = "filter-rect-line";
-
-export function setFilterRect(map: MLMap, bbox: BBox | null) {
-  if (bbox === null) {
-    if (map.getLayer(FILTER_LINE)) map.removeLayer(FILTER_LINE);
-    if (map.getLayer(FILTER_FILL)) map.removeLayer(FILTER_FILL);
-    if (map.getSource(FILTER_SOURCE)) map.removeSource(FILTER_SOURCE);
-    return;
-  }
-  const data: GeoJSON.Feature<GeoJSON.Polygon> = {
-    type: "Feature",
-    geometry: bboxToPolygon(bbox),
-    properties: {},
-  };
-  const src = map.getSource(FILTER_SOURCE) as maplibregl.GeoJSONSource | undefined;
-  if (src) {
-    src.setData(data);
-    return;
-  }
-  map.addSource(FILTER_SOURCE, { type: "geojson", data });
-  map.addLayer({
-    id: FILTER_FILL,
-    type: "fill",
-    source: FILTER_SOURCE,
-    paint: { "fill-color": "#ef476f", "fill-opacity": 0.05 },
-  });
-  map.addLayer({
-    id: FILTER_LINE,
-    type: "line",
-    source: FILTER_SOURCE,
-    paint: {
-      "line-color": "#ef476f",
-      "line-width": 2,
-      "line-dasharray": [3, 2],
-    },
-  });
-}
-
-const PREVIEW_SOURCE = "draw-preview";
-const PREVIEW_FILL = "draw-preview-fill";
-const PREVIEW_LINE = "draw-preview-line";
-
-function setPreviewRect(map: MLMap, bbox: BBox | null) {
-  if (bbox === null) {
-    if (map.getLayer(PREVIEW_LINE)) map.removeLayer(PREVIEW_LINE);
-    if (map.getLayer(PREVIEW_FILL)) map.removeLayer(PREVIEW_FILL);
-    if (map.getSource(PREVIEW_SOURCE)) map.removeSource(PREVIEW_SOURCE);
-    return;
-  }
-  const data: GeoJSON.Feature<GeoJSON.Polygon> = {
-    type: "Feature",
-    geometry: bboxToPolygon(bbox),
-    properties: {},
-  };
-  const src = map.getSource(PREVIEW_SOURCE) as maplibregl.GeoJSONSource | undefined;
-  if (src) {
-    src.setData(data);
-    return;
-  }
-  map.addSource(PREVIEW_SOURCE, { type: "geojson", data });
-  map.addLayer({
-    id: PREVIEW_FILL,
-    type: "fill",
-    source: PREVIEW_SOURCE,
-    paint: { "fill-color": "#4f8cff", "fill-opacity": 0.12 },
-  });
-  map.addLayer({
-    id: PREVIEW_LINE,
-    type: "line",
-    source: PREVIEW_SOURCE,
-    paint: { "line-color": "#4f8cff", "line-width": 2 },
-  });
-}
-
-export interface DrawSession {
-  cancel(): void;
-}
-
-export function startDrawRectangle(map: MLMap, onComplete: (b: BBox | null) => void): DrawSession {
-  const canvas = map.getCanvas();
-  canvas.style.cursor = "crosshair";
-  map.dragPan.disable();
-  map.boxZoom.disable();
-  map.doubleClickZoom.disable();
-
-  let start: { lng: number; lat: number } | null = null;
-  let finished = false;
-
-  const cleanup = () => {
-    if (finished) return;
-    finished = true;
-    canvas.style.cursor = "";
-    map.dragPan.enable();
-    map.boxZoom.enable();
-    map.doubleClickZoom.enable();
-    map.off("mousedown", onDown);
-    map.off("mousemove", onMove);
-    map.off("mouseup", onUp);
-    setPreviewRect(map, null);
-  };
-
-  function onDown(e: MapMouseEvent) {
-    e.preventDefault();
-    start = { lng: e.lngLat.lng, lat: e.lngLat.lat };
-  }
-  function onMove(e: MapMouseEvent) {
-    if (!start) return;
-    setPreviewRect(map, makeBBox(start, e.lngLat));
-  }
-  function onUp(e: MapMouseEvent) {
-    if (!start) {
-      cleanup();
-      onComplete(null);
-      return;
-    }
-    const bbox = makeBBox(start, e.lngLat);
-    cleanup();
-    if (bbox.xmin === bbox.xmax || bbox.ymin === bbox.ymax) {
-      onComplete(null);
-    } else {
-      onComplete(bbox);
-    }
-  }
-
-  map.on("mousedown", onDown);
-  map.on("mousemove", onMove);
-  map.on("mouseup", onUp);
-
-  return {
-    cancel: () => {
-      cleanup();
-      onComplete(null);
-    },
-  };
-}
-
-function makeBBox(a: { lng: number; lat: number }, b: { lng: number; lat: number }): BBox {
-  return {
-    xmin: Math.min(a.lng, b.lng),
-    xmax: Math.max(a.lng, b.lng),
-    ymin: Math.min(a.lat, b.lat),
-    ymax: Math.max(a.lat, b.lat),
-  };
-}
-
-export function bboxesIntersect(a: BBox, b: BBox): boolean {
-  return !(a.xmax < b.xmin || a.xmin > b.xmax || a.ymax < b.ymin || a.ymin > b.ymax);
-}
