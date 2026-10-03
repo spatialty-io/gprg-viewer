@@ -23,19 +23,18 @@ export interface BBox {
   ymax: number;
 }
 
-export type StatRaw = number | bigint | string | Date | Uint8Array | boolean;
-
 export interface ColumnStats {
   path: string;
+  pathParts: string[];
   type: string;
   codec: string;
+  encodings: string[];
+  hasPageIndex: boolean;
   numValues: number;
   compressedBytes: number;
   uncompressedBytes: number;
   min: string | null;
   max: string | null;
-  minRaw: StatRaw | null;
-  maxRaw: StatRaw | null;
   nullCount: number | null;
   distinctCount: number | null;
   geoBbox: BBox | null;
@@ -48,6 +47,10 @@ export interface RowGroupInfo {
   totalCompressedBytes: number;
   totalUncompressedBytes: number;
   fileOffset: number | null;
+  /** First byte of the row group's column chunks. */
+  byteStart: number | null;
+  /** One past the last byte of the row group's column chunks. */
+  byteEnd: number | null;
   bbox: BBox | null;
   bboxSource: "native" | "covering" | "bbox-struct" | "unavailable";
   geometryTypes: number[] | null;
@@ -61,9 +64,11 @@ export interface KeyValueEntry {
 
 export interface GeoParquetInfo {
   metadata: FileMetaData;
+  geo: GeoMetadata | null;
   primaryColumn: string | null;
   geoVersion: string | null;
   crs: string | null;
+  coveringRoots: string[];
   rowGroups: RowGroupInfo[];
   warnings: string[];
   fileSize: number | null;
@@ -71,6 +76,8 @@ export interface GeoParquetInfo {
   createdBy: string | null;
   metadataLength: number | null;
   keyValueMetadata: KeyValueEntry[];
+  /** Byte span of all Column Index and Offset Index structures, when present. */
+  pageIndexRange: { start: number; end: number } | null;
   loadPageBboxes(rowGroupIndex: number): Promise<BBox[]>;
 }
 
@@ -78,18 +85,26 @@ const COVERING_KEYS = ["xmin", "ymin", "xmax", "ymax"] as const;
 type CoveringKey = (typeof COVERING_KEYS)[number];
 type CoveringPaths = Record<CoveringKey, string[]>;
 
-interface GeoColumnDef {
+export interface ProjJson {
+  type?: string;
+  id?: { authority: string; code: string | number };
+  coordinate_system?: { axis?: { unit?: unknown }[] };
+  source_crs?: ProjJson;
+}
+
+export interface GeoColumnDef {
   encoding?: string;
   geometry_types?: string[];
   bbox?: number[];
-  crs?: { id?: { authority: string; code: string | number } };
+  crs?: ProjJson | string | null;
   covering?: { bbox?: Record<string, string[]> };
 }
 
-interface GeoMetadata {
+export interface GeoMetadata {
   version?: string;
   primary_column?: string;
   columns?: Record<string, GeoColumnDef>;
+  lod?: unknown;
 }
 
 export async function loadFromUrl(url: string): Promise<GeoParquetInfo> {
@@ -133,11 +148,7 @@ export function analyze(
     primaryColumn = geo.primary_column ?? null;
     geoVersion = geo.version ?? null;
     const primary = primaryColumn && geo.columns ? geo.columns[primaryColumn] : null;
-    if (primary?.crs?.id) {
-      crs = `${primary.crs.id.authority}:${primary.crs.id.code}`;
-    } else if (primary) {
-      crs = "OGC:CRS84";
-    }
+    if (primary) crs = describeCrs(primary.crs);
     if (primary?.covering?.bbox) {
       coveringPaths = pickCoveringPaths(primary.covering.bbox, warnings);
     }
@@ -163,9 +174,13 @@ export function analyze(
 
   return {
     metadata,
+    geo,
     primaryColumn,
     geoVersion,
     crs,
+    coveringRoots: coveringPaths
+      ? [...new Set(COVERING_KEYS.map((k) => coveringPaths[k][0]))]
+      : [],
     rowGroups,
     warnings,
     fileSize,
@@ -173,8 +188,28 @@ export function analyze(
     createdBy: metadata.created_by ?? null,
     metadataLength: typeof metadata.metadata_length === "number" ? metadata.metadata_length : null,
     keyValueMetadata,
+    pageIndexRange: findPageIndexRange(metadata),
     loadPageBboxes: createPageBboxLoader(file, metadata, coveringPaths),
   };
+}
+
+function findPageIndexRange(metadata: FileMetaData): { start: number; end: number } | null {
+  let start = Infinity;
+  let end = -Infinity;
+  for (const rg of metadata.row_groups) {
+    for (const c of rg.columns) {
+      const spans: Array<[bigint | undefined, number | undefined]> = [
+        [c.column_index_offset, c.column_index_length],
+        [c.offset_index_offset, c.offset_index_length],
+      ];
+      for (const [offset, length] of spans) {
+        if (offset === undefined || length === undefined) continue;
+        start = Math.min(start, Number(offset));
+        end = Math.max(end, Number(offset) + length);
+      }
+    }
+  }
+  return Number.isFinite(start) ? { start, end } : null;
 }
 
 function createPageBboxLoader(
@@ -299,6 +334,15 @@ function numericIndexValue(value: unknown): number | null {
   return null;
 }
 
+function describeCrs(crs: GeoColumnDef["crs"]): string {
+  if (crs === undefined) return "OGC:CRS84";
+  if (crs === null) return "unknown";
+  if (typeof crs === "string") return crs;
+  const id = crs.id ?? crs.source_crs?.id;
+  if (id) return `${id.authority}:${id.code}`;
+  return crs.type ?? "PROJJSON";
+}
+
 function readGeoMetadata(metadata: FileMetaData): GeoMetadata | null {
   const entry = metadata.key_value_metadata?.find((kv) => kv.key === "geo");
   if (!entry?.value) return null;
@@ -358,6 +402,20 @@ function summarizeRowGroup(
   const totalCompressedBytes = sumColumns(rg, (m) => Number(m.total_compressed_size));
   const totalUncompressedBytes = sumColumns(rg, (m) => Number(m.total_uncompressed_size));
   const fileOffset = rg.file_offset !== undefined ? Number(rg.file_offset) : null;
+  let byteStart: number | null = null;
+  let byteEnd: number | null = null;
+  for (const c of rg.columns) {
+    const m = c.meta_data;
+    if (!m) continue;
+    // Some writers record a zero dictionary offset; the data page then starts the chunk.
+    const dict = m.dictionary_page_offset;
+    const start = Number(
+      dict !== undefined && dict > 0n && dict < m.data_page_offset ? dict : m.data_page_offset,
+    );
+    const end = start + Number(m.total_compressed_size);
+    if (byteStart === null || start < byteStart) byteStart = start;
+    if (byteEnd === null || end > byteEnd) byteEnd = end;
+  }
   const columns: ColumnStats[] = rg.columns
     .map(extractColumnStats)
     .filter((c): c is ColumnStats => c !== null);
@@ -396,6 +454,8 @@ function summarizeRowGroup(
     totalCompressedBytes,
     totalUncompressedBytes,
     fileOffset,
+    byteStart,
+    byteEnd,
     bbox,
     bboxSource,
     geometryTypes,
@@ -412,15 +472,16 @@ function extractColumnStats(c: ColumnChunk): ColumnStats | null {
   const geo = m.geospatial_statistics;
   return {
     path: m.path_in_schema.join("."),
+    pathParts: m.path_in_schema,
     type: m.type,
     codec: m.codec,
+    encodings: m.encodings,
+    hasPageIndex: c.column_index_offset !== undefined && c.offset_index_offset !== undefined,
     numValues: Number(m.num_values),
     compressedBytes: Number(m.total_compressed_size),
     uncompressedBytes: Number(m.total_uncompressed_size),
     min: formatStatValue(minRaw),
     max: formatStatValue(maxRaw),
-    minRaw: toStatRaw(minRaw),
-    maxRaw: toStatRaw(maxRaw),
     nullCount: stats?.null_count !== undefined ? Number(stats.null_count) : null,
     distinctCount: stats?.distinct_count !== undefined ? Number(stats.distinct_count) : null,
     geoBbox: geo?.bbox
@@ -433,21 +494,6 @@ function extractColumnStats(c: ColumnChunk): ColumnStats | null {
       : null,
     geoTypes: geo?.geospatial_types ?? null,
   };
-}
-
-function toStatRaw(v: unknown): StatRaw | null {
-  if (v === undefined || v === null) return null;
-  if (
-    typeof v === "number" ||
-    typeof v === "bigint" ||
-    typeof v === "string" ||
-    typeof v === "boolean"
-  ) {
-    return v;
-  }
-  if (v instanceof Date) return v;
-  if (v instanceof Uint8Array) return v;
-  return null;
 }
 
 function formatStatValue(v: unknown): string | null {

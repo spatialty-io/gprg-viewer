@@ -1,48 +1,64 @@
 import "./style.css";
 import {
-  bboxesIntersect,
   buildFeatureCollection,
   colorFor,
   createMap,
   ensureLayers,
   fitToBBox,
-  fitToRowGroups,
   onRowGroupClick,
   onRowGroupHover,
-  setFilterRect,
   setHovered,
   setPageBboxes,
   setSelected,
-  startDrawRectangle,
   updateFeatures,
 } from "./map.ts";
+import type { RowGroupFeature, RowGroupState } from "./map.ts";
 import { formatBBox, formatBytes, loadFromFile, loadFromUrl } from "./parquet.ts";
 import type { BBox, ColumnStats, GeoParquetInfo, KeyValueEntry, RowGroupInfo } from "./parquet.ts";
-import { FILTER_OPS, makeId, rowGroupMatchesFilters } from "./filter.ts";
-import type { ColumnFilter, FilterOp } from "./filter.ts";
+import {
+  analyzeCogp,
+  levelColor,
+  queryViewport,
+  selectLevel,
+  targetResolution,
+} from "./cogp.ts";
+import type { ByteBreakdown, CogpAnalysis, Issue, LevelAnalysis, ViewportQuery } from "./cogp.ts";
 import maplibregl from "maplibre-gl";
 import type { Map as MLMap } from "maplibre-gl";
-import type { DrawSession } from "./map.ts";
+
+const SAMPLES = [
+  "https://cogp-demo.spatialty.io/v2.0.0/pois.cogp.parquet",
+  "https://cogp-demo.spatialty.io/v2.0.0/segments.cogp.parquet",
+  "https://cogp-demo.spatialty.io/v2.0.0/buildings.cogp.parquet",
+  "https://cogp-demo.spatialty.io/v2.0.0/admin.cogp.parquet",
+];
+
+type ViewMode = "all" | "prefix" | "level" | "auto";
+type Tab = "levels" | "rowgroups";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("#app not found");
 
 app.innerHTML = `
   <header class="toolbar">
-    <h1>GeoParquet RowGroup BBox Viewer</h1>
+    <h1>COGP Layout Inspector</h1>
     <input
       id="url"
       type="text"
-      placeholder="https://example.com/data.parquet"
+      list="samples"
+      placeholder="https://example.com/data.cogp.parquet"
       autocomplete="off"
       spellcheck="false"
     />
+    <datalist id="samples">
+      ${SAMPLES.map((url) => `<option value="${url}"></option>`).join("")}
+    </datalist>
     <button id="load-url" class="primary" type="button">Load URL</button>
     <label class="file">
       Open file
       <input id="file" type="file" accept=".parquet,.geoparquet,application/octet-stream" hidden />
     </label>
-    <span id="status" class="status">Open a GeoParquet file to begin.</span>
+    <span id="status" class="status">Open a COGP (GeoParquet) file to begin.</span>
     <a
       class="repo-link"
       href="https://github.com/spatialty-io/gprg-viewer"
@@ -58,39 +74,80 @@ app.innerHTML = `
   </header>
   <main>
     <div id="map"></div>
+    <div class="level-panel" id="level-panel" hidden>
+      <div class="lp-row">
+        <label for="view-mode">View</label>
+        <select id="view-mode">
+          <option value="auto">Auto: level for map zoom</option>
+          <option value="prefix">Prefix up to level</option>
+          <option value="level">Rows added by level</option>
+          <option value="all">All row groups</option>
+        </select>
+      </div>
+      <div class="lp-row" id="level-row">
+        <input id="level-slider" type="range" min="0" max="0" step="1" value="0" />
+        <span id="level-label" class="lp-level"></span>
+      </div>
+      <div id="viewport-info" class="viewport-info"></div>
+    </div>
   </main>
   <section class="bottom">
     <div class="file-stats" id="file-stats" hidden></div>
-    <details class="kv-meta" id="kv-meta" hidden>
-      <summary><span class="kv-meta-label">Parquet key/value metadata</span> <span class="kv-meta-count" id="kv-meta-count"></span></summary>
+    <details class="meta-block issues" id="issues" hidden>
+      <summary><span class="meta-label">COGP validation</span> <span class="meta-count" id="issues-count"></span></summary>
+      <ul class="issue-list" id="issue-list"></ul>
+    </details>
+    <details class="meta-block kv-meta" id="kv-meta" hidden>
+      <summary><span class="meta-label">Parquet key/value metadata</span> <span class="meta-count" id="kv-meta-count"></span></summary>
       <div class="kv-meta-list" id="kv-meta-list"></div>
     </details>
+    <div class="layout-strip" id="layout-strip" hidden>
+      <div class="strip-label">File layout <span class="muted">(byte offsets, colored by level)</span></div>
+      <div class="strip-track" id="strip-levels"></div>
+      <div class="strip-track bytes" id="strip-bytes"></div>
+    </div>
     <div class="controls">
-      <button id="show-all" type="button">Show all</button>
-      <button id="hide-all" type="button">Hide all</button>
-      <span class="sep" aria-hidden="true"></span>
-      <div id="filter-list" class="filter-list"></div>
-      <button id="draw-filter" type="button">+ Rect</button>
-      <button id="add-col-filter" type="button">+ Filter</button>
-      <span id="filter-info" class="match" hidden></span>
+      <div class="tabs" role="tablist">
+        <button type="button" role="tab" class="tab active" data-tab="levels">Levels</button>
+        <button type="button" role="tab" class="tab" data-tab="rowgroups">Row groups</button>
+      </div>
+      <span class="legend" id="legend"></span>
       <button id="clear-sel" type="button" hidden class="clear-sel">Clear selection</button>
     </div>
     <div class="panes" id="panes">
       <div class="pane">
         <div class="table-wrap">
-          <div id="empty-rg" class="empty">Open a GeoParquet file to begin.</div>
+          <div id="empty-main" class="empty">Open a COGP (GeoParquet) file to begin.</div>
+          <table class="rg" id="level-table" hidden>
+            <thead>
+              <tr>
+                <th>Level</th>
+                <th title="Nominal rendering resolution in CRS units">Resolution</th>
+                <th title="Map zoom range (512px tiles, equator) for which this level is selected">Zoom</th>
+                <th title="Row groups introduced by this level">New RGs</th>
+                <th>New rows</th>
+                <th>Prefix rows</th>
+                <th>New bytes</th>
+                <th>Prefix bytes</th>
+                <th title="Overview LoD used to render this level">LoD</th>
+                <th title="Geometry bytes to render the whole prefix: overview LoD vs primary geometry">Prefix geometry</th>
+                <th title="Sum of new row group bbox areas / area of their union. 1.0 = no overlap">BBox overlap</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
           <table class="rg" id="rg-table" hidden>
             <thead>
               <tr>
-                <th><input type="checkbox" id="toggle-all" checked title="Toggle all" /></th>
                 <th>#</th>
+                <th>Level</th>
                 <th>Rows</th>
                 <th>Compressed</th>
-                <th>Uncompressed</th>
-                <th>Offset</th>
-                <th>BBox source</th>
+                <th title="Primary geometry / overview / bbox covering / attributes">Bytes by role</th>
+                <th>Primary geom</th>
+                <th>Overviews</th>
+                <th>Byte range</th>
                 <th>BBox (xmin, ymin, xmax, ymax)</th>
-                <th>Geom types</th>
               </tr>
             </thead>
             <tbody></tbody>
@@ -105,16 +162,17 @@ app.innerHTML = `
             <thead>
               <tr>
                 <th>Column</th>
+                <th>Role</th>
                 <th>Type</th>
                 <th>Codec</th>
+                <th>Encodings</th>
                 <th>Values</th>
                 <th>Nulls</th>
-                <th>Distinct</th>
                 <th>Compressed</th>
                 <th>Uncompressed</th>
+                <th title="Column Index + Offset Index present">Page index</th>
                 <th>Min</th>
                 <th>Max</th>
-                <th>Geo bbox</th>
               </tr>
             </thead>
             <tbody></tbody>
@@ -124,46 +182,62 @@ app.innerHTML = `
     </div>
   </section>
   <div class="drop-overlay" id="drop-overlay" hidden>
-    <div class="drop-overlay-inner">Drop GeoParquet file to open</div>
+    <div class="drop-overlay-inner">Drop a COGP (GeoParquet) file to open</div>
   </div>
 `;
 
-const mapContainer = document.querySelector<HTMLDivElement>("#map")!;
-const map: MLMap = createMap(mapContainer);
+const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector)!;
 
-const urlInput = document.querySelector<HTMLInputElement>("#url")!;
-const loadUrlBtn = document.querySelector<HTMLButtonElement>("#load-url")!;
-const fileInput = document.querySelector<HTMLInputElement>("#file")!;
-const statusEl = document.querySelector<HTMLSpanElement>("#status")!;
-const rgTable = document.querySelector<HTMLTableElement>("#rg-table")!;
+const map: MLMap = createMap($<HTMLDivElement>("#map"));
+
+const urlInput = $<HTMLInputElement>("#url");
+const loadUrlBtn = $<HTMLButtonElement>("#load-url");
+const fileInput = $<HTMLInputElement>("#file");
+const statusEl = $<HTMLSpanElement>("#status");
+const levelPanel = $<HTMLDivElement>("#level-panel");
+const viewModeEl = $<HTMLSelectElement>("#view-mode");
+const levelRow = $<HTMLDivElement>("#level-row");
+const levelSlider = $<HTMLInputElement>("#level-slider");
+const levelLabel = $<HTMLSpanElement>("#level-label");
+const viewportInfo = $<HTMLDivElement>("#viewport-info");
+const fileStatsEl = $<HTMLDivElement>("#file-stats");
+const issuesEl = $<HTMLDetailsElement>("#issues");
+const issuesCountEl = $<HTMLSpanElement>("#issues-count");
+const issueListEl = $<HTMLUListElement>("#issue-list");
+const kvMetaEl = $<HTMLDetailsElement>("#kv-meta");
+const kvMetaListEl = $<HTMLDivElement>("#kv-meta-list");
+const kvMetaCountEl = $<HTMLSpanElement>("#kv-meta-count");
+const stripEl = $<HTMLDivElement>("#layout-strip");
+const stripLevelsEl = $<HTMLDivElement>("#strip-levels");
+const stripBytesEl = $<HTMLDivElement>("#strip-bytes");
+const legendEl = $<HTMLSpanElement>("#legend");
+const clearSelBtn = $<HTMLButtonElement>("#clear-sel");
+const emptyMain = $<HTMLDivElement>("#empty-main");
+const levelTable = $<HTMLTableElement>("#level-table");
+const levelTbody = levelTable.querySelector("tbody")!;
+const rgTable = $<HTMLTableElement>("#rg-table");
 const rgTbody = rgTable.querySelector("tbody")!;
-const rgEmpty = document.querySelector<HTMLDivElement>("#empty-rg")!;
-const colTable = document.querySelector<HTMLTableElement>("#col-table")!;
+const colPane = $<HTMLDivElement>("#col-pane");
+const colHeader = $<HTMLDivElement>("#col-pane-header");
+const colTable = $<HTMLTableElement>("#col-table");
 const colTbody = colTable.querySelector("tbody")!;
-const colEmpty = document.querySelector<HTMLDivElement>("#empty-col")!;
-const colHeader = document.querySelector<HTMLDivElement>("#col-pane-header")!;
-const colPane = document.querySelector<HTMLDivElement>("#col-pane")!;
-const toggleAllEl = document.querySelector<HTMLInputElement>("#toggle-all")!;
-const showAllBtn = document.querySelector<HTMLButtonElement>("#show-all")!;
-const hideAllBtn = document.querySelector<HTMLButtonElement>("#hide-all")!;
-const drawFilterBtn = document.querySelector<HTMLButtonElement>("#draw-filter")!;
-const filterInfo = document.querySelector<HTMLSpanElement>("#filter-info")!;
-const clearSelBtn = document.querySelector<HTMLButtonElement>("#clear-sel")!;
-const filterList = document.querySelector<HTMLDivElement>("#filter-list")!;
-const addColFilterBtn = document.querySelector<HTMLButtonElement>("#add-col-filter")!;
-const fileStatsEl = document.querySelector<HTMLDivElement>("#file-stats")!;
-const kvMetaEl = document.querySelector<HTMLDetailsElement>("#kv-meta")!;
-const kvMetaListEl = document.querySelector<HTMLDivElement>("#kv-meta-list")!;
-const kvMetaCountEl = document.querySelector<HTMLSpanElement>("#kv-meta-count")!;
-const dropOverlay = document.querySelector<HTMLDivElement>("#drop-overlay")!;
+const colEmpty = $<HTMLDivElement>("#empty-col");
+const dropOverlay = $<HTMLDivElement>("#drop-overlay");
+const tabButtons = [...document.querySelectorAll<HTMLButtonElement>(".tab")];
 
-let current: GeoParquetInfo | null = null;
+interface Loaded {
+  info: GeoParquetInfo;
+  cogp: CogpAnalysis;
+  /** Longitude/latitude bbox per row group, or null when it cannot be drawn. */
+  lngLat: (BBox | null)[];
+}
+
+let current: Loaded | null = null;
 let selectedIndex: number | null = null;
-let filterRect: BBox | null = null;
-let drawSession: DrawSession | null = null;
-let suppressMapClick = false;
-const visibility = new Map<number, boolean>();
-let columnFilters: ColumnFilter[] = [];
+let viewMode: ViewMode = "auto";
+let selectedLevel = 0;
+let tab: Tab = "levels";
+let lastQuery: ViewportQuery | null = null;
 let candidatePopup: maplibregl.Popup | null = null;
 
 function setStatus(msg: string, kind: "info" | "error" = "info") {
@@ -187,6 +261,7 @@ async function handleUrl() {
   try {
     const info = await loadFromUrl(url);
     onLoaded(info, url);
+    writeUrlParam(url);
   } catch (err) {
     console.error(err);
     setStatus(`Failed to load: ${formatError(err)}`, "error");
@@ -201,6 +276,7 @@ async function handleFile(file: File) {
   try {
     const info = await loadFromFile(file);
     onLoaded(info, file.name);
+    writeUrlParam(null);
   } catch (err) {
     console.error(err);
     setStatus(`Failed to read ${file.name}: ${formatError(err)}`, "error");
@@ -209,74 +285,139 @@ async function handleFile(file: File) {
   }
 }
 
+function writeUrlParam(url: string | null) {
+  const next = new URL(window.location.href);
+  if (url) next.searchParams.set("url", url);
+  else next.searchParams.delete("url");
+  window.history.replaceState(null, "", next);
+}
+
 function formatError(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);
 }
 
 function onLoaded(info: GeoParquetInfo, label: string) {
-  cancelDraw();
   closeCandidatePopup();
-  setFilter(null);
-  columnFilters = [];
-  renderFilters();
-  current = info;
+  const cogp = analyzeCogp(info);
+  const lngLat = info.rowGroups.map((rg) => toDisplayBBox(rg.bbox, cogp));
+  current = { info, cogp, lngLat };
   selectedIndex = null;
-  visibility.clear();
-  for (const rg of info.rowGroups) visibility.set(rg.index, true);
-  toggleAllEl.checked = true;
-  toggleAllEl.indeterminate = false;
+  lastQuery = null;
+  const levelCount = cogp.levelAnalyses.length;
+  selectedLevel = 0;
+  viewMode = levelCount === 0 ? "all" : cogp.units.metresPerUnit !== null && cogp.fromLngLat ? "auto" : "prefix";
+  viewModeEl.value = viewMode;
+  for (const option of viewModeEl.options) {
+    if (option.value === "auto") option.disabled = !(cogp.units.metresPerUnit !== null && cogp.fromLngLat);
+    else if (option.value !== "all") option.disabled = levelCount === 0;
+  }
+  levelSlider.max = String(Math.max(0, levelCount - 1));
+  levelSlider.value = "0";
+  levelPanel.hidden = false;
   clearSelBtn.hidden = true;
-  renderFileStats(info, label);
+  setTab(levelCount > 0 ? "levels" : "rowgroups");
+
+  renderFileStats(info, cogp, label);
+  renderIssues(cogp.issues);
   renderKeyValueMetadata(info.keyValueMetadata);
-  renderRowGroupTable(info);
+  renderLegend();
+  renderStrip();
+  renderLevelTable();
+  renderRowGroupTable();
   renderColumnTable(null);
-  renderMap();
   setSelected(map, null);
   setPageBboxes(map, []);
-  fitToRowGroups(map, info.rowGroups);
-  const warnSuffix = info.warnings.length ? ` · ${info.warnings.length} warning(s)` : "";
-  setStatus(`Loaded ${label}${warnSuffix}.`);
+  fitToAll();
+  refreshView();
+
+  const drawable = lngLat.filter((b) => b !== null).length;
+  const notes: string[] = [];
+  if (!cogp.declared) notes.push("no geo.lod");
+  else if (!cogp.valid) notes.push("invalid geo.lod");
+  if (drawable < info.rowGroups.length) notes.push(`${info.rowGroups.length - drawable} RG(s) not drawable`);
+  setStatus(`Loaded ${label}${notes.length ? ` · ${notes.join(" · ")}` : ""}.`, cogp.valid ? "info" : "error");
 }
 
-function renderFileStats(info: GeoParquetInfo, label: string) {
+function toDisplayBBox(bbox: BBox | null, cogp: CogpAnalysis): BBox | null {
+  if (!bbox) return null;
+  if (cogp.toLngLat) return cogp.toLngLat(bbox);
+  // Unknown CRS: draw only coordinates that look like longitude/latitude.
+  const inRange =
+    bbox.xmin >= -180 && bbox.xmax <= 180 && bbox.ymin >= -90 && bbox.ymax <= 90;
+  return inRange ? bbox : null;
+}
+
+// ---------------------------------------------------------------------------
+// Summary panels
+
+function renderFileStats(info: GeoParquetInfo, cogp: CogpAnalysis, label: string) {
   const totalRows = info.rowGroups.reduce((s, r) => s + r.numRows, 0);
   const compressed = info.rowGroups.reduce((s, r) => s + r.totalCompressedBytes, 0);
-  const uncompressed = info.rowGroups.reduce((s, r) => s + r.totalUncompressedBytes, 0);
-  const ratio = compressed > 0 ? uncompressed / compressed : 0;
-  const columnCount = info.rowGroups[0]?.columns.length ?? 0;
-
   const stats: Array<[string, string, string?]> = [
     ["Source", label, label],
     ["File size", info.fileSize !== null ? formatBytes(info.fileSize) : "—"],
-    ["Parquet version", String(info.parquetVersion)],
     ["Footer", info.metadataLength !== null ? formatBytes(info.metadataLength) : "—"],
     ["Writer", info.createdBy ?? "—", info.createdBy ?? undefined],
     ["Row groups", info.rowGroups.length.toLocaleString()],
     ["Rows", totalRows.toLocaleString()],
-    ["Columns", columnCount.toLocaleString()],
-    ["Compressed", `${formatBytes(compressed)}${ratio > 0 ? ` (${ratio.toFixed(2)}× ratio)` : ""}`],
-    ["Uncompressed", formatBytes(uncompressed)],
+    ["Compressed", formatBytes(compressed)],
   ];
   if (info.geoVersion) stats.push(["GeoParquet", info.geoVersion]);
   if (info.primaryColumn) stats.push(["Geometry", info.primaryColumn]);
-  if (info.crs) stats.push(["CRS", info.crs]);
+  if (info.crs) stats.push(["CRS", `${info.crs} (${cogp.units.label})`]);
+  stats.push(["COGP", !cogp.declared ? "not declared" : cogp.valid ? "valid" : "invalid"]);
+  if (cogp.declared) stats.push(["Levels", cogp.levels.length.toLocaleString()]);
+  if (cogp.overviews) {
+    const overviewBytes = cogp.breakdown.reduce((sum, b) => sum + b.overview, 0);
+    const primaryBytes = cogp.breakdown.reduce((sum, b) => sum + b.primary, 0);
+    stats.push([
+      "Overviews",
+      `${cogp.overviews.column} · ${cogp.overviews.encoding} · ${cogp.overviews.lods.length} LoD(s)`,
+    ]);
+    stats.push([
+      "Bytes by role",
+      `overviews ${formatShare(overviewBytes, compressed)} · primary ${formatShare(primaryBytes, compressed)}`,
+    ]);
+  } else if (cogp.declared) {
+    stats.push(["Overviews", "none"]);
+  }
 
   fileStatsEl.innerHTML = "";
   for (const [k, v, title] of stats) {
-    const item = document.createElement("div");
-    item.className = "stat";
-    const key = document.createElement("span");
-    key.className = "stat-key";
-    key.textContent = k;
-    const val = document.createElement("span");
-    val.className = "stat-val";
-    val.textContent = v;
-    if (title) val.title = title;
+    const item = el("div", "stat");
+    const key = el("span", "stat-key", k);
+    const val = el("span", "stat-val", v);
+    if (k === "COGP") val.classList.add(cogp.valid ? "ok" : "bad");
+    val.title = title ?? v;
     item.append(key, val);
     fileStatsEl.appendChild(item);
   }
   fileStatsEl.hidden = false;
+}
+
+function renderIssues(issues: Issue[]) {
+  issueListEl.innerHTML = "";
+  issuesEl.hidden = false;
+  const counts = { error: 0, warning: 0, info: 0 };
+  for (const issue of issues) counts[issue.severity]++;
+  issuesCountEl.textContent =
+    issues.length === 0
+      ? "no issues"
+      : (["error", "warning", "info"] as const)
+          .filter((s) => counts[s] > 0)
+          .map((s) => `${counts[s]} ${s}${counts[s] === 1 ? "" : "s"}`)
+          .join(" · ");
+  issuesCountEl.className = `meta-count ${counts.error ? "bad" : counts.warning ? "warn" : "ok"}`;
+  issuesEl.open = counts.error > 0;
+  if (issues.length === 0) {
+    issueListEl.appendChild(el("li", "issue info", "geo.lod is consistent with the footer."));
+  }
+  for (const issue of issues) {
+    const li = el("li", `issue ${issue.severity}`);
+    li.append(el("span", "issue-sev", issue.severity), el("span", "issue-msg", issue.message));
+    issueListEl.appendChild(li);
+  }
 }
 
 function renderKeyValueMetadata(entries: KeyValueEntry[]) {
@@ -289,25 +430,11 @@ function renderKeyValueMetadata(entries: KeyValueEntry[]) {
   kvMetaEl.hidden = false;
   kvMetaCountEl.textContent = `${entries.length} entr${entries.length === 1 ? "y" : "ies"}`;
   for (const entry of entries) {
-    kvMetaListEl.appendChild(buildKeyValueItem(entry));
+    const item = el("div", "kv-meta-item");
+    item.appendChild(el("div", "kv-meta-key", entry.key));
+    item.appendChild(el("pre", "kv-meta-value mono", formatKeyValue(entry.value)));
+    kvMetaListEl.appendChild(item);
   }
-}
-
-function buildKeyValueItem(entry: KeyValueEntry): HTMLElement {
-  const item = document.createElement("div");
-  item.className = "kv-meta-item";
-
-  const keyEl = document.createElement("div");
-  keyEl.className = "kv-meta-key";
-  keyEl.textContent = entry.key;
-  item.appendChild(keyEl);
-
-  const pre = document.createElement("pre");
-  pre.className = "kv-meta-value mono";
-  pre.textContent = formatKeyValue(entry.value);
-  item.appendChild(pre);
-
-  return item;
 }
 
 function formatKeyValue(value: string | null): string {
@@ -327,290 +454,270 @@ function formatKeyValue(value: string | null): string {
   return value;
 }
 
-function visibleRowGroups(info: GeoParquetInfo): RowGroupInfo[] {
-  return info.rowGroups.filter((rg) => {
-    if (filterRect && !(rg.bbox && bboxesIntersect(rg.bbox, filterRect))) return false;
-    if (columnFilters.length && !rowGroupMatchesFilters(rg, columnFilters)) return false;
-    return true;
-  });
-}
-
-function availableColumnPaths(): string[] {
-  if (!current) return [];
-  const seen = new Set<string>();
-  for (const rg of current.rowGroups) {
-    for (const c of rg.columns) seen.add(c.path);
+function renderLegend() {
+  legendEl.innerHTML = "";
+  for (const [role, label] of ROLE_LABELS) {
+    const item = el("span", "legend-item");
+    const sw = el("span", `role-swatch role-${role}`);
+    item.append(sw, label);
+    legendEl.appendChild(item);
   }
-  return [...seen].sort();
 }
 
-function renderFilters() {
-  filterList.innerHTML = "";
-  if (filterRect) filterList.appendChild(buildSpatialChip(filterRect));
-  for (const f of columnFilters) {
-    filterList.appendChild(buildFilterRow(f));
-  }
-  updateMatchInfo();
+// ---------------------------------------------------------------------------
+// Layout strip
+
+function rowGroupColor(index: number): string {
+  if (!current) return colorFor(index);
+  const level = current.cogp.rowGroupLevel[index];
+  const count = current.cogp.levels.length;
+  return level === null ? colorFor(index) : levelColor(level, count);
 }
 
-function buildSpatialChip(rect: BBox): HTMLElement {
-  const wrap = document.createElement("div");
-  wrap.className = "filter-chip spatial";
-  const label = document.createElement("span");
-  label.className = "chip-label";
-  label.textContent = "rect";
-  const value = document.createElement("span");
-  value.className = "chip-value mono";
-  value.textContent = formatBBox(rect);
-  value.title = formatBBox(rect);
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "remove";
-  remove.textContent = "×";
-  remove.title = "Clear spatial filter";
-  remove.addEventListener("click", () => setFilter(null));
-  wrap.append(label, value, remove);
-  return wrap;
-}
-
-function buildFilterRow(f: ColumnFilter): HTMLElement {
-  const wrap = document.createElement("div");
-  wrap.className = "filter-chip col-filter";
-  wrap.dataset.id = f.id;
-
-  const colSel = document.createElement("select");
-  colSel.title = "Column";
-  for (const path of availableColumnPaths()) {
-    const opt = document.createElement("option");
-    opt.value = path;
-    opt.textContent = path;
-    if (path === f.column) opt.selected = true;
-    colSel.appendChild(opt);
-  }
-
-  const opSel = document.createElement("select");
-  opSel.title = "Operator";
-  for (const op of FILTER_OPS) {
-    const opt = document.createElement("option");
-    opt.value = op.value;
-    opt.textContent = op.label;
-    if (op.value === f.op) opt.selected = true;
-    opSel.appendChild(opt);
-  }
-
-  const v1 = document.createElement("input");
-  v1.type = "text";
-  v1.placeholder = "value";
-  v1.value = f.value;
-  v1.size = 12;
-
-  const v2 = document.createElement("input");
-  v2.type = "text";
-  v2.placeholder = "and";
-  v2.value = f.value2;
-  v2.size = 8;
-
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "remove";
-  remove.textContent = "×";
-  remove.title = "Remove filter";
-
-  const syncValueInputs = () => {
-    const def = FILTER_OPS.find((o) => o.value === (opSel.value as FilterOp));
-    const need = def?.needsValue ?? 0;
-    v1.hidden = need < 1;
-    v2.hidden = need < 2;
-  };
-  syncValueInputs();
-
-  colSel.addEventListener("change", () => {
-    f.column = colSel.value;
-    scheduleApply();
-  });
-  opSel.addEventListener("change", () => {
-    f.op = opSel.value as FilterOp;
-    syncValueInputs();
-    scheduleApply();
-  });
-  v1.addEventListener("input", () => {
-    f.value = v1.value;
-    scheduleApply();
-  });
-  v2.addEventListener("input", () => {
-    f.value2 = v2.value;
-    scheduleApply();
-  });
-  remove.addEventListener("click", () => {
-    columnFilters = columnFilters.filter((x) => x.id !== f.id);
-    renderFilters();
-    scheduleApply();
-  });
-
-  wrap.append(colSel, opSel, v1, v2, remove);
-  return wrap;
-}
-
-function addColumnFilter() {
-  if (!current) {
-    setStatus("Load a file before adding filters.", "error");
-    return;
-  }
-  const paths = availableColumnPaths();
-  if (paths.length === 0) return;
-  const f: ColumnFilter = {
-    id: makeId(),
-    column: paths[0],
-    op: "eq",
-    value: "",
-    value2: "",
-  };
-  columnFilters.push(f);
-  renderFilters();
-  applyColumnFilters();
-}
-
-let applyScheduled = false;
-function scheduleApply() {
-  if (applyScheduled) return;
-  applyScheduled = true;
-  requestAnimationFrame(() => {
-    applyScheduled = false;
-    applyColumnFilters();
-  });
-}
-
-function applyColumnFilters() {
+function renderStrip() {
+  stripLevelsEl.innerHTML = "";
+  stripBytesEl.innerHTML = "";
   if (!current) return;
-  closeCandidatePopup();
-  // Drop selection if it no longer matches.
-  if (selectedIndex !== null) {
-    const rg = current.rowGroups.find((r) => r.index === selectedIndex);
-    if (!rg || !visibleRowGroups(current).some((v) => v.index === rg.index)) {
-      clearSelection();
-    }
+  const { info, cogp } = current;
+  const end =
+    info.fileSize ??
+    Math.max(0, ...info.rowGroups.map((rg) => rg.byteEnd ?? 0)) + (info.metadataLength ?? 0) + 8;
+  if (end <= 0 || info.rowGroups.length === 0) {
+    stripEl.hidden = true;
+    return;
   }
-  renderRowGroupTable(current);
-  renderMap();
-  updateMatchInfo();
+  stripEl.hidden = false;
+  const pct = (bytes: number) => `${((bytes / end) * 100).toFixed(4)}%`;
+
+  // Row groups by byte range.
+  for (const rg of info.rowGroups) {
+    if (rg.byteStart === null || rg.byteEnd === null) continue;
+    const seg = el("div", "seg rg-seg");
+    seg.dataset.index = String(rg.index);
+    seg.style.left = pct(rg.byteStart);
+    seg.style.width = pct(rg.byteEnd - rg.byteStart);
+    seg.style.background = rowGroupColor(rg.index);
+    const level = cogp.rowGroupLevel[rg.index];
+    seg.title = `RG #${rg.index}${level !== null ? ` · level ${level}` : ""} · ${rg.numRows.toLocaleString()} rows · ${formatBytes(rg.totalCompressedBytes)} @ ${rg.byteStart.toLocaleString()}`;
+    bindRowGroupHover(seg, rg.index);
+    seg.addEventListener("click", () => selectRowGroup(rg.index, { fit: true }));
+    stripBytesEl.appendChild(seg);
+  }
+  if (info.pageIndexRange) {
+    const { start, end: stop } = info.pageIndexRange;
+    const pageIndex = el("div", "seg page-index-seg");
+    pageIndex.style.left = pct(start);
+    pageIndex.style.width = pct(stop - start);
+    pageIndex.title = `Page Index (Column + Offset Index) · ${formatBytes(stop - start)} @ ${start.toLocaleString()}`;
+    stripBytesEl.appendChild(pageIndex);
+  }
+  if (info.metadataLength !== null && info.fileSize !== null) {
+    const footer = el("div", "seg footer-seg");
+    footer.style.left = pct(info.fileSize - info.metadataLength - 8);
+    footer.style.width = pct(info.metadataLength + 8);
+    footer.title = `Footer · ${formatBytes(info.metadataLength)}`;
+    stripBytesEl.appendChild(footer);
+  }
+
+  // Level spans over the same byte axis.
+  for (const level of cogp.levelAnalyses) {
+    if (level.newRowGroups === 0) continue;
+    const first = info.rowGroups[level.firstNewRowGroup];
+    const last = info.rowGroups[Math.min(level.rowGroupEnd, info.rowGroups.length - 1)];
+    if (!first || !last || first.byteStart === null || last.byteEnd === null) continue;
+    const start = Math.min(first.byteStart, last.byteStart ?? first.byteStart);
+    const stop = Math.max(last.byteEnd, first.byteEnd ?? last.byteEnd);
+    const span = el("div", "seg level-seg");
+    span.dataset.level = String(level.index);
+    span.style.left = pct(start);
+    span.style.width = pct(stop - start);
+    span.style.background = levelColor(level.index, cogp.levels.length);
+    span.title = `Level ${level.index} · RG ${level.firstNewRowGroup}–${level.rowGroupEnd} · ${formatBytes(level.newBytes)}`;
+    if ((stop - start) / end > 0.025) span.textContent = `L${level.index}`;
+    span.addEventListener("click", () => focusLevel(level.index));
+    stripLevelsEl.appendChild(span);
+  }
 }
 
-function updateMatchInfo() {
+// ---------------------------------------------------------------------------
+// Tables
+
+const ROLE_LABELS: Array<[keyof Omit<ByteBreakdown, "overviewByLod" | "total">, string]> = [
+  ["primary", "primary geom"],
+  ["overview", "overviews"],
+  ["covering", "bbox covering"],
+  ["attribute", "attributes"],
+];
+
+function setTab(next: Tab) {
+  tab = next;
+  for (const button of tabButtons) {
+    const active = button.dataset.tab === next;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  }
+  updateTableVisibility();
+}
+
+function updateTableVisibility() {
   if (!current) {
-    filterInfo.hidden = true;
+    levelTable.hidden = true;
+    rgTable.hidden = true;
+    emptyMain.hidden = false;
     return;
   }
-  const total = current.rowGroups.length;
-  const matched = visibleRowGroups(current).length;
-  const filterActive = filterRect !== null || columnFilters.length > 0;
-  if (!filterActive) {
-    filterInfo.hidden = true;
-    return;
-  }
-  filterInfo.hidden = false;
-  filterInfo.textContent = `${matched.toLocaleString()} / ${total.toLocaleString()} match`;
+  const noLevels = current.cogp.levelAnalyses.length === 0;
+  levelTable.hidden = tab !== "levels" || noLevels;
+  rgTable.hidden = tab !== "rowgroups" || current.info.rowGroups.length === 0;
+  emptyMain.hidden = !(levelTable.hidden && rgTable.hidden);
+  emptyMain.textContent =
+    tab === "levels" ? "No geo.lod levels in this file." : "No row groups found.";
 }
 
-function renderRowGroupTable(info: GeoParquetInfo) {
-  rgTbody.innerHTML = "";
-  if (info.rowGroups.length === 0) {
-    rgTable.hidden = true;
-    rgEmpty.hidden = false;
-    rgEmpty.textContent = "No row groups found.";
-    return;
+function renderLevelTable() {
+  levelTbody.innerHTML = "";
+  if (!current) return;
+  const { cogp } = current;
+  const total = cogp.levelAnalyses.at(-1)?.cumulativeBytes ?? 0;
+  for (const level of cogp.levelAnalyses) {
+    const tr = document.createElement("tr");
+    tr.dataset.level = String(level.index);
+    const tdLevel = el("td");
+    tdLevel.append(swatch(levelColor(level.index, cogp.levels.length)), `L${level.index}`);
+    tr.append(
+      tdLevel,
+      td(formatNumber(level.resolution), "num mono"),
+      td(formatZoomRange(level), "mono"),
+      td(
+        level.newRowGroups === 0
+          ? "— (refines)"
+          : `${level.newRowGroups.toLocaleString()} (${level.firstNewRowGroup}–${level.rowGroupEnd})`,
+        "num",
+      ),
+      td(level.newRows.toLocaleString(), "num"),
+      td(level.cumulativeRows.toLocaleString(), "num muted"),
+      td(formatBytes(level.newBytes), "num"),
+      tdBar(level.cumulativeBytes, total),
+      tdLod(level.lod),
+      td(formatPrefixGeometry(level), "num"),
+      td(level.overlap === null ? "—" : `${level.overlap.toFixed(2)}×`, `num ${overlapClass(level.overlap)}`),
+    );
+    tr.addEventListener("click", () => focusLevel(level.index));
+    levelTbody.appendChild(tr);
   }
-  const rows = visibleRowGroups(info);
-  if (rows.length === 0) {
-    rgTable.hidden = true;
-    rgEmpty.hidden = false;
-    rgEmpty.textContent = "No row groups match the current filter.";
-    return;
-  }
-  rgTable.hidden = false;
-  rgEmpty.hidden = true;
+  syncLevelRows();
+}
 
-  for (const rg of rows) {
+function formatZoomRange(level: LevelAnalysis): string {
+  const z = (v: number | null) => (v === null ? null : v.toFixed(1));
+  const from = z(level.zoomFrom);
+  const to = z(level.zoomTo);
+  if (from === null && to === null) {
+    return current?.cogp.units.metresPerUnit === null ? "—" : "all";
+  }
+  if (from === null) return `< ${to}`;
+  if (to === null) return `≥ ${from}`;
+  return `${from} – ${to}`;
+}
+
+function formatPrefixGeometry(level: LevelAnalysis): string {
+  if (!level.lod) return formatBytes(level.prefix.primary);
+  const ratio = level.prefix.primary > 0 ? level.prefix.overview / level.prefix.primary : 0;
+  return `${formatBytes(level.prefix.overview)} vs ${formatBytes(level.prefix.primary)} (${(ratio * 100).toFixed(0)}%)`;
+}
+
+function overlapClass(overlap: number | null): string {
+  if (overlap === null) return "muted";
+  if (overlap < 1.5) return "ok";
+  if (overlap < 3) return "warn";
+  return "bad";
+}
+
+function tdLod(lod: string | null): HTMLTableCellElement {
+  const cell = td(lod ?? "—", "mono");
+  const def = current?.cogp.overviews?.lods.find((l) => l.name === lod);
+  if (def) {
+    cell.title = [
+      def.geometryType ? `geometry_type: ${def.geometryType}` : null,
+      def.scale ? `scale: [${def.scale.join(", ")}]` : null,
+      def.offset ? `offset: [${def.offset.join(", ")}]` : null,
+      `level_indices: [${def.levelIndices.join(", ")}]`,
+      `effective boundary: RG ${def.effectiveEnd}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  return cell;
+}
+
+function tdBar(value: number, total: number): HTMLTableCellElement {
+  const cell = td("", "num bar-cell");
+  const bar = el("span", "bar");
+  bar.style.width = `${total > 0 ? (value / total) * 100 : 0}%`;
+  cell.append(bar, el("span", "bar-label", formatBytes(value)));
+  return cell;
+}
+
+function renderRowGroupTable() {
+  rgTbody.innerHTML = "";
+  if (!current) return;
+  const { info, cogp } = current;
+  for (const rg of info.rowGroups) {
+    const b = cogp.breakdown[rg.index];
+    const level = cogp.rowGroupLevel[rg.index];
     const tr = document.createElement("tr");
     tr.dataset.index = String(rg.index);
 
-    const tdToggle = document.createElement("td");
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = visibility.get(rg.index) ?? true;
-    cb.addEventListener("click", (e) => e.stopPropagation());
-    cb.addEventListener("change", () => {
-      visibility.set(rg.index, cb.checked);
-      renderMap();
-      syncToggleAll();
-    });
-    tdToggle.appendChild(cb);
+    const tdIndex = el("td");
+    tdIndex.append(swatch(rowGroupColor(rg.index)), String(rg.index));
 
-    const tdIndex = document.createElement("td");
-    const swatch = document.createElement("span");
-    swatch.className = "swatch";
-    swatch.style.background = colorFor(rg.index);
-    tdIndex.appendChild(swatch);
-    tdIndex.append(String(rg.index));
+    const roleBar = el("td", "role-cell");
+    const stack = el("div", "role-bar");
+    stack.title = ROLE_LABELS.map(([role, label]) => `${label}: ${formatBytes(b[role])}`).join("\n");
+    for (const [role] of ROLE_LABELS) {
+      if (b[role] <= 0 || b.total <= 0) continue;
+      const part = el("span", `role-${role}`);
+      part.style.width = `${(b[role] / b.total) * 100}%`;
+      stack.appendChild(part);
+    }
+    roleBar.appendChild(stack);
 
-    const tdRows = document.createElement("td");
-    tdRows.className = "num";
-    tdRows.textContent = rg.numRows.toLocaleString();
-
-    const tdCompressed = document.createElement("td");
-    tdCompressed.className = "num";
-    tdCompressed.textContent = formatBytes(rg.totalCompressedBytes);
-
-    const tdUncompressed = document.createElement("td");
-    tdUncompressed.className = "num muted";
-    tdUncompressed.textContent = formatBytes(rg.totalUncompressedBytes);
-
-    const tdOffset = document.createElement("td");
-    tdOffset.className = "num mono";
-    tdOffset.textContent = rg.fileOffset !== null ? rg.fileOffset.toLocaleString() : "—";
-
-    const tdSource = document.createElement("td");
-    tdSource.className = "muted";
-    tdSource.textContent = rg.bboxSource;
-
-    const tdBBox = document.createElement("td");
-    tdBBox.className = "bbox";
-    tdBBox.textContent = rg.bbox ? formatBBox(rg.bbox) : "—";
-    if (!rg.bbox) tdBBox.title = "bbox unavailable for this row group";
-
-    const tdGeoTypes = document.createElement("td");
-    tdGeoTypes.className = "muted";
-    tdGeoTypes.textContent = rg.geometryTypes?.length ? rg.geometryTypes.join(", ") : "—";
+    // LoDs whose coverage includes this row group; later LoDs are null here.
+    const covering = (cogp.overviews?.lods ?? []).filter((lod) => lod.effectiveEnd >= rg.index);
+    const tdOverviews = td(
+      cogp.overviews ? `${formatBytes(b.overview)} · ${covering.length} LoD${covering.length === 1 ? "" : "s"}` : "—",
+      "num",
+    );
+    tdOverviews.title = Object.entries(b.overviewByLod)
+      .map(([lod, bytes]) => `${lod}: ${formatBytes(bytes)}`)
+      .join("\n");
 
     tr.append(
-      tdToggle,
       tdIndex,
-      tdRows,
-      tdCompressed,
-      tdUncompressed,
-      tdOffset,
-      tdSource,
-      tdBBox,
-      tdGeoTypes,
+      td(level === null ? "—" : `L${level}`, "mono"),
+      td(rg.numRows.toLocaleString(), "num"),
+      td(formatBytes(rg.totalCompressedBytes), "num"),
+      roleBar,
+      td(formatBytes(b.primary), "num"),
+      tdOverviews,
+      td(
+        rg.byteStart !== null && rg.byteEnd !== null
+          ? `${rg.byteStart.toLocaleString()} – ${rg.byteEnd.toLocaleString()}`
+          : "—",
+        "num mono",
+      ),
+      td(rg.bbox ? formatBBox(rg.bbox) : "—", "bbox"),
     );
-
-    tr.addEventListener("click", () => {
-      onRowSelect(rg);
-    });
-    tr.addEventListener("mouseenter", () => {
-      if (rg.bbox) setHovered(map, rg.index);
-    });
-    tr.addEventListener("mouseleave", () => {
-      setHovered(map, null);
-    });
-
+    tr.addEventListener("click", () => selectRowGroup(rg.index, { fit: true }));
+    bindRowGroupHover(tr, rg.index);
     rgTbody.appendChild(tr);
   }
-  syncToggleAll();
+  syncRowGroupRows();
 }
 
 function renderColumnTable(rg: RowGroupInfo | null) {
   colTbody.innerHTML = "";
-  if (!rg) {
+  if (!rg || !current) {
     colPane.hidden = true;
     colTable.hidden = true;
     colEmpty.hidden = true;
@@ -626,116 +733,71 @@ function renderColumnTable(rg: RowGroupInfo | null) {
   }
   colTable.hidden = false;
   colEmpty.hidden = true;
-
-  for (const col of rg.columns) {
-    colTbody.appendChild(buildColumnRow(col));
-  }
+  for (const col of rg.columns) colTbody.appendChild(buildColumnRow(col));
 }
 
 function renderColumnHeader(rg: RowGroupInfo, pageIndexStatus?: string) {
+  const level = current?.cogp.rowGroupLevel[rg.index];
   const suffix = pageIndexStatus ? ` · ${pageIndexStatus}` : "";
-  colHeader.textContent = `Row group #${rg.index} · ${rg.columns.length} column${rg.columns.length === 1 ? "" : "s"}${suffix}`;
+  colHeader.textContent = `Row group #${rg.index}${level !== null && level !== undefined ? ` · level ${level}` : ""} · ${rg.columns.length} column${rg.columns.length === 1 ? "" : "s"}${suffix}`;
 }
 
 function buildColumnRow(col: ColumnStats): HTMLTableRowElement {
   const tr = document.createElement("tr");
-
-  const tdPath = document.createElement("td");
-  tdPath.className = "mono";
+  const role = current!.cogp.columnRole(col);
+  const tdPath = td(col.path, "mono");
   tdPath.style.color = "var(--fg)";
-  tdPath.textContent = col.path;
-
-  const tdType = document.createElement("td");
-  tdType.className = "muted";
-  tdType.textContent = col.type;
-
-  const tdCodec = document.createElement("td");
-  tdCodec.className = "muted";
-  tdCodec.textContent = col.codec;
-
-  const tdValues = document.createElement("td");
-  tdValues.className = "num";
-  tdValues.textContent = col.numValues.toLocaleString();
-
-  const tdNulls = document.createElement("td");
-  tdNulls.className = "num";
-  tdNulls.textContent = col.nullCount !== null ? col.nullCount.toLocaleString() : "—";
-
-  const tdDistinct = document.createElement("td");
-  tdDistinct.className = "num muted";
-  tdDistinct.textContent = col.distinctCount !== null ? col.distinctCount.toLocaleString() : "—";
-
-  const tdCompressed = document.createElement("td");
-  tdCompressed.className = "num";
-  tdCompressed.textContent = formatBytes(col.compressedBytes);
-
-  const tdUncompressed = document.createElement("td");
-  tdUncompressed.className = "num muted";
-  tdUncompressed.textContent = formatBytes(col.uncompressedBytes);
-
-  const tdMin = document.createElement("td");
-  tdMin.className = "mono";
-  tdMin.textContent = col.min ?? "—";
-  if (col.min) tdMin.title = col.min;
-
-  const tdMax = document.createElement("td");
-  tdMax.className = "mono";
-  tdMax.textContent = col.max ?? "—";
-  if (col.max) tdMax.title = col.max;
-
-  const tdGeo = document.createElement("td");
-  tdGeo.className = "bbox";
-  if (col.geoBbox) {
-    tdGeo.textContent = formatBBox(col.geoBbox);
-    if (col.geoTypes?.length) {
-      tdGeo.title = `geometry_types: ${col.geoTypes.join(", ")}`;
-    }
-  } else {
-    tdGeo.textContent = "—";
-  }
-
+  const tdRole = el("td");
+  tdRole.append(el("span", `role-swatch role-${role}`), role);
   tr.append(
     tdPath,
-    tdType,
-    tdCodec,
-    tdValues,
-    tdNulls,
-    tdDistinct,
-    tdCompressed,
-    tdUncompressed,
-    tdMin,
-    tdMax,
-    tdGeo,
+    tdRole,
+    td(col.type, "muted"),
+    td(col.codec, "muted"),
+    td(col.encodings.join(", "), "muted small"),
+    td(col.numValues.toLocaleString(), "num"),
+    td(col.nullCount !== null ? col.nullCount.toLocaleString() : "—", "num"),
+    td(formatBytes(col.compressedBytes), "num"),
+    td(formatBytes(col.uncompressedBytes), "num muted"),
+    td(col.hasPageIndex ? "yes" : "—", col.hasPageIndex ? "ok" : "muted"),
+    tdTitled(col.min ?? "—", "mono"),
+    tdTitled(col.max ?? "—", "mono"),
   );
   return tr;
 }
 
-function onRowSelect(rg: RowGroupInfo, options: { fit?: boolean } = { fit: true }) {
+// ---------------------------------------------------------------------------
+// Selection and hover
+
+function selectRowGroup(index: number, options: { fit?: boolean } = {}) {
   if (!current) return;
-  if (selectedIndex === rg.index) {
+  if (selectedIndex === index) {
     clearSelection();
     return;
   }
-  selectedIndex = rg.index;
-  for (const tr of rgTbody.querySelectorAll<HTMLTableRowElement>("tr")) {
-    tr.classList.toggle("selected", tr.dataset.index === String(rg.index));
-  }
-  setSelected(map, rg.bbox ? rg.index : null);
+  const rg = current.info.rowGroups[index];
+  const display = current.lngLat[index];
+  selectedIndex = index;
+  syncRowGroupRows();
+  setSelected(map, display ? index : null);
   setPageBboxes(map, []);
   renderColumnTable(rg);
   renderColumnHeader(rg, "Loading Page Index…");
-  if (rg.bbox && options.fit !== false) fitToBBox(map, rg.bbox);
+  if (display && options.fit) fitToBBox(map, display);
   clearSelBtn.hidden = false;
   void showPageBboxes(rg);
 }
 
 async function showPageBboxes(rg: RowGroupInfo) {
   if (!current) return;
-  const info = current;
+  const loaded = current;
   try {
-    const bboxes = await info.loadPageBboxes(rg.index);
-    if (current !== info || selectedIndex !== rg.index) return;
-    setPageBboxes(map, bboxes);
+    const bboxes = await loaded.info.loadPageBboxes(rg.index);
+    if (current !== loaded || selectedIndex !== rg.index) return;
+    const display = bboxes
+      .map((b) => toDisplayBBox(b, loaded.cogp))
+      .filter((b): b is BBox => b !== null);
+    setPageBboxes(map, display);
     renderColumnHeader(
       rg,
       bboxes.length === 0
@@ -743,7 +805,7 @@ async function showPageBboxes(rg: RowGroupInfo) {
         : `${bboxes.length.toLocaleString()} Page Index bbox${bboxes.length === 1 ? "" : "es"}`,
     );
   } catch (err) {
-    if (current !== info || selectedIndex !== rg.index) return;
+    if (current !== loaded || selectedIndex !== rg.index) return;
     setPageBboxes(map, []);
     renderColumnHeader(rg, "Page Index read failed");
     setStatus(`Failed to read Page Index: ${formatError(err)}`, "error");
@@ -752,13 +814,45 @@ async function showPageBboxes(rg: RowGroupInfo) {
 
 function clearSelection() {
   selectedIndex = null;
-  for (const tr of rgTbody.querySelectorAll<HTMLTableRowElement>("tr")) {
-    tr.classList.remove("selected");
-  }
+  syncRowGroupRows();
   setSelected(map, null);
   setPageBboxes(map, []);
   renderColumnTable(null);
   clearSelBtn.hidden = true;
+}
+
+function syncRowGroupRows() {
+  for (const tr of rgTbody.querySelectorAll<HTMLTableRowElement>("tr")) {
+    tr.classList.toggle("selected", tr.dataset.index === String(selectedIndex));
+  }
+  for (const seg of stripBytesEl.querySelectorAll<HTMLElement>(".rg-seg")) {
+    seg.classList.toggle("selected", seg.dataset.index === String(selectedIndex));
+  }
+}
+
+function syncLevelRows() {
+  const focused = viewMode === "all" ? null : effectiveLevel();
+  for (const tr of levelTbody.querySelectorAll<HTMLTableRowElement>("tr")) {
+    tr.classList.toggle("selected", tr.dataset.level === String(focused));
+  }
+  for (const seg of stripLevelsEl.querySelectorAll<HTMLElement>(".level-seg")) {
+    seg.classList.toggle("selected", seg.dataset.level === String(focused));
+  }
+}
+
+function bindRowGroupHover(target: HTMLElement, index: number) {
+  target.addEventListener("mouseenter", () => highlightRowGroup(index));
+  target.addEventListener("mouseleave", () => highlightRowGroup(null));
+}
+
+function highlightRowGroup(index: number | null) {
+  setHovered(map, index !== null && current?.lngLat[index] ? index : null);
+  for (const node of [
+    ...rgTbody.querySelectorAll<HTMLElement>("tr"),
+    ...stripBytesEl.querySelectorAll<HTMLElement>(".rg-seg"),
+  ]) {
+    node.classList.toggle("hovered", index !== null && node.dataset.index === String(index));
+  }
 }
 
 function closeCandidatePopup() {
@@ -770,27 +864,21 @@ function closeCandidatePopup() {
 function showCandidatePopup(lngLat: maplibregl.LngLat, indices: number[]) {
   if (!current) return;
   closeCandidatePopup();
-  const candidates: RowGroupInfo[] = [];
-  for (const i of indices) {
-    const rg = current.rowGroups.find((r) => r.index === i);
-    if (rg) candidates.push(rg);
-  }
-  candidates.sort((a, b) => a.index - b.index);
+  const candidates = indices
+    .map((i) => current!.info.rowGroups[i])
+    .filter((rg): rg is RowGroupInfo => rg !== undefined)
+    .sort((a, b) => a.index - b.index);
   if (candidates.length === 0) return;
 
-  const container = document.createElement("div");
-  container.className = "candidate-popup";
-
-  const title = document.createElement("div");
-  title.className = "candidate-title";
-  title.textContent =
-    candidates.length === 1
-      ? `Row group #${candidates[0].index}`
-      : `${candidates.length} candidates`;
-  container.appendChild(title);
-
-  const list = document.createElement("div");
-  list.className = "candidate-list";
+  const container = el("div", "candidate-popup");
+  container.appendChild(
+    el(
+      "div",
+      "candidate-title",
+      candidates.length === 1 ? `Row group #${candidates[0].index}` : `${candidates.length} row groups`,
+    ),
+  );
+  const list = el("div", "candidate-list");
   for (const rg of candidates) list.appendChild(buildCandidateItem(rg));
   container.appendChild(list);
 
@@ -809,162 +897,277 @@ function showCandidatePopup(lngLat: maplibregl.LngLat, indices: number[]) {
 }
 
 function buildCandidateItem(rg: RowGroupInfo): HTMLElement {
-  const item = document.createElement("button");
-  item.type = "button";
-  item.className = "candidate-item";
+  const { cogp } = current!;
+  const item = el("button", "candidate-item");
+  item.setAttribute("type", "button");
   if (selectedIndex === rg.index) item.classList.add("selected");
-
-  const head = document.createElement("div");
-  head.className = "candidate-head";
-  const swatch = document.createElement("span");
-  swatch.className = "swatch";
-  swatch.style.background = colorFor(rg.index);
-  head.appendChild(swatch);
-  const idx = document.createElement("span");
-  idx.className = "candidate-index";
-  idx.textContent = `#${rg.index}`;
-  head.appendChild(idx);
-  const rows = document.createElement("span");
-  rows.className = "candidate-rows muted";
-  rows.textContent = `${rg.numRows.toLocaleString()} rows`;
-  head.appendChild(rows);
+  const head = el("div", "candidate-head");
+  head.append(swatch(rowGroupColor(rg.index)), el("span", "candidate-index", `#${rg.index}`));
+  const level = cogp.rowGroupLevel[rg.index];
+  if (level !== null) head.append(el("span", "candidate-level", `L${level}`));
+  head.append(el("span", "candidate-rows muted", `${rg.numRows.toLocaleString()} rows`));
   item.appendChild(head);
 
-  const meta = document.createElement("dl");
-  meta.className = "candidate-meta";
+  const b = cogp.breakdown[rg.index];
+  const meta = el("dl", "candidate-meta") as HTMLDListElement;
   appendMeta(meta, "Compressed", formatBytes(rg.totalCompressedBytes));
-  appendMeta(meta, "Uncompressed", formatBytes(rg.totalUncompressedBytes));
-  appendMeta(meta, "Offset", rg.fileOffset !== null ? rg.fileOffset.toLocaleString() : "—");
-  appendMeta(meta, "BBox source", rg.bboxSource);
+  appendMeta(meta, "Primary geom", formatBytes(b.primary));
+  if (cogp.overviews) appendMeta(meta, "Overviews", formatBytes(b.overview));
+  appendMeta(meta, "Attributes", formatBytes(b.attribute));
   appendMeta(meta, "BBox", rg.bbox ? formatBBox(rg.bbox) : "—", true);
-  appendMeta(meta, "Geom types", rg.geometryTypes?.length ? rg.geometryTypes.join(", ") : "—");
   item.appendChild(meta);
 
   item.addEventListener("click", () => {
-    onRowSelect(rg, { fit: false });
+    selectRowGroup(rg.index);
     closeCandidatePopup();
   });
-  item.addEventListener("mouseenter", () => {
-    if (rg.bbox) setHovered(map, rg.index);
-  });
-  item.addEventListener("mouseleave", () => {
-    setHovered(map, null);
-  });
-
+  bindRowGroupHover(item, rg.index);
   return item;
 }
 
 function appendMeta(dl: HTMLDListElement, key: string, value: string, mono = false) {
-  const dt = document.createElement("dt");
-  dt.textContent = key;
-  const dd = document.createElement("dd");
-  dd.textContent = value;
-  if (mono) dd.classList.add("mono");
-  dl.append(dt, dd);
+  const dd = el("dd", mono ? "mono" : "", value);
+  dl.append(el("dt", "", key), dd);
 }
 
-let mapReady = false;
-map.on("load", () => {
-  mapReady = true;
-  renderMap();
-});
+// ---------------------------------------------------------------------------
+// Level view and viewport read estimate
 
-onRowGroupClick(map, (indices, lngLat) => {
-  if (drawSession || suppressMapClick) return;
-  showCandidatePopup(lngLat, indices);
-});
+function autoLevel(): { level: number; tileZoom: number; target: number } | null {
+  if (!current || current.cogp.levels.length === 0) return null;
+  const tileZoom = Math.max(0, Math.floor(map.getZoom()));
+  const target = targetResolution(tileZoom, map.getCenter().lat, current.cogp.units);
+  if (target === null) return null;
+  return { level: selectLevel(current.cogp.levels, target), tileZoom, target };
+}
 
-onRowGroupHover(map, (index) => {
-  setHovered(map, index);
-  for (const tr of rgTbody.querySelectorAll<HTMLTableRowElement>("tr")) {
-    tr.classList.toggle("hovered", index !== null && tr.dataset.index === String(index));
-  }
-});
+function effectiveLevel(): number | null {
+  if (!current || current.cogp.levels.length === 0) return null;
+  if (viewMode === "auto") return autoLevel()?.level ?? null;
+  if (viewMode === "all") return current.cogp.levels.length - 1;
+  return selectedLevel;
+}
 
-function renderMap() {
+function focusLevel(index: number) {
   if (!current) return;
-  if (!mapReady) return; // Will be flushed once the map's initial load fires.
-  const fc = buildFeatureCollection(visibleRowGroups(current), visibility);
+  selectedLevel = index;
+  levelSlider.value = String(index);
+  if (viewMode === "auto" || viewMode === "all") {
+    viewMode = "level";
+    viewModeEl.value = viewMode;
+  }
+  const level = current.cogp.levelAnalyses[index];
+  const bbox = level?.newBBox ? toDisplayBBox(level.newBBox, current.cogp) : null;
+  if (bbox) fitToBBox(map, bbox, 60);
+  refreshView();
+}
+
+function rowGroupState(index: number, level: number | null, hits: Set<number>): RowGroupState {
+  if (!current || level === null) return "active";
+  const def = current.cogp.levelAnalyses[level];
+  const rgLevel = current.cogp.rowGroupLevel[index];
+  switch (viewMode) {
+    case "all":
+      return "active";
+    case "prefix":
+      return index <= def.rowGroupEnd ? "active" : "hidden";
+    case "level":
+      if (rgLevel === level) return "active";
+      return index <= def.rowGroupEnd ? "dim" : "hidden";
+    case "auto":
+      if (index > def.rowGroupEnd) return "hidden";
+      return hits.has(index) ? "hit" : "dim";
+  }
+}
+
+function refreshView() {
+  if (!current) return;
+  const level = effectiveLevel();
+  levelRow.hidden = viewMode === "auto" || viewMode === "all" || current.cogp.levels.length === 0;
+  levelLabel.textContent = levelRow.hidden ? "" : describeLevel(selectedLevel);
+
+  lastQuery = level === null ? null : runViewportQuery(level);
+  renderViewportInfo(level);
+  syncLevelRows();
+
+  if (!mapReady) return;
+  const hits = new Set(lastQuery?.hits ?? []);
+  const items: RowGroupFeature[] = [];
+  for (const rg of current.info.rowGroups) {
+    const bbox = current.lngLat[rg.index];
+    if (!bbox) continue;
+    items.push({
+      index: rg.index,
+      bbox,
+      color: rowGroupColor(rg.index),
+      state: rowGroupState(rg.index, level, hits),
+    });
+  }
+  const fc = buildFeatureCollection(items);
   if (map.getSource("rowgroups")) updateFeatures(map, fc);
   else ensureLayers(map, fc);
 }
 
-function syncToggleAll() {
+function describeLevel(index: number): string {
+  const level = current?.cogp.levelAnalyses[index];
+  if (!level) return "";
+  return `L${index} · res ${formatNumber(level.resolution)}${level.lod ? ` · ${level.lod}` : ""}`;
+}
+
+function viewportBBox(): BBox | null {
+  if (!current?.cogp.fromLngLat) return null;
+  const bounds = map.getBounds();
+  const lngLat: BBox = {
+    xmin: Math.max(-180, bounds.getWest()),
+    ymin: Math.max(-90, bounds.getSouth()),
+    xmax: Math.min(180, bounds.getEast()),
+    ymax: Math.min(90, bounds.getNorth()),
+  };
+  return current.cogp.fromLngLat(lngLat);
+}
+
+function runViewportQuery(level: number): ViewportQuery | null {
+  if (!current) return null;
+  const viewport = viewportBBox();
+  if (!viewport) return null;
+  return queryViewport(current.info, current.cogp, level, viewport);
+}
+
+function renderViewportInfo(level: number | null) {
+  viewportInfo.innerHTML = "";
   if (!current) return;
-  const all = current.rowGroups.length;
-  const on = current.rowGroups.filter((r) => visibility.get(r.index) ?? true).length;
-  toggleAllEl.checked = on === all;
-  toggleAllEl.indeterminate = on > 0 && on < all;
+  const { cogp, info } = current;
+  const lines: Array<[string, string, string?]> = [];
+  const auto = autoLevel();
+  lines.push([
+    "Map zoom",
+    `${map.getZoom().toFixed(2)}${auto ? ` · tile z${auto.tileZoom} · target ${formatNumber(auto.target)} ${unitSymbol()}/px` : ""}`,
+  ]);
+  if (level === null) {
+    lines.push(["Level", cogp.declared ? "unavailable" : "no geo.lod"]);
+  } else {
+    const def = cogp.levelAnalyses[level];
+    lines.push([
+      viewMode === "auto" ? "Auto level" : "Level",
+      `L${level} · res ${formatNumber(def.resolution)}${def.lod ? ` · LoD ${def.lod}` : ""}`,
+    ]);
+    lines.push([
+      "Prefix",
+      `RG 0–${def.rowGroupEnd} (${(def.rowGroupEnd + 1).toLocaleString()} of ${info.rowGroups.length.toLocaleString()}) · ${def.cumulativeRows.toLocaleString()} rows`,
+    ]);
+  }
+  const q = lastQuery;
+  if (q) {
+    lines.push([
+      "In view",
+      `${q.hits.length.toLocaleString()} RG · ≤ ${q.rows.toLocaleString()} rows`,
+      "Row groups in the prefix whose bbox intersects the viewport (row group pruning only; Page Index pruning can read less).",
+    ]);
+    lines.push([
+      "Geometry",
+      q.lod
+        ? `${formatBytes(q.bytes.overview)} (${q.lod}) vs ${formatBytes(q.bytes.primary)} primary`
+        : `${formatBytes(q.bytes.primary)} primary`,
+    ]);
+    lines.push(["Attributes", formatBytes(q.bytes.attribute)]);
+    lines.push(["All columns", formatBytes(q.bytes.total)]);
+  } else if (level !== null) {
+    lines.push(["In view", "unavailable for this CRS"]);
+  }
+  const dl = el("dl", "vp-list") as HTMLDListElement;
+  for (const [k, v, title] of lines) {
+    const dt = el("dt", "", k);
+    const dd = el("dd", "", v);
+    if (title) dd.title = title;
+    dl.append(dt, dd);
+  }
+  viewportInfo.appendChild(dl);
 }
 
-function setAllVisibility(value: boolean) {
+function unitSymbol(): string {
+  const kind = current?.cogp.units.kind;
+  return kind === "degree" ? "°" : kind === "metre" ? "m" : "units";
+}
+
+function fitToAll() {
   if (!current) return;
-  for (const rg of current.rowGroups) visibility.set(rg.index, value);
-  for (const cb of rgTbody.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')) {
-    cb.checked = value;
-  }
-  syncToggleAll();
-  renderMap();
+  const boxes = current.lngLat.filter((b): b is BBox => b !== null);
+  if (boxes.length === 0) return;
+  const union = boxes.reduce((u, b) => ({
+    xmin: Math.min(u.xmin, b.xmin),
+    ymin: Math.min(u.ymin, b.ymin),
+    xmax: Math.max(u.xmax, b.xmax),
+    ymax: Math.max(u.ymax, b.ymax),
+  }));
+  fitToBBox(map, union, 60);
 }
 
-function setFilter(rect: BBox | null) {
-  filterRect = rect;
-  setFilterRect(map, rect);
-  closeCandidatePopup();
-  renderFilters();
-  drawFilterBtn.hidden = rect !== null;
-  if (!current) {
-    updateMatchInfo();
-    return;
-  }
-  // Drop selection if it no longer matches the combined filter.
-  if (selectedIndex !== null) {
-    const rg = current.rowGroups.find((r) => r.index === selectedIndex);
-    if (!rg || !visibleRowGroups(current).some((v) => v.index === rg.index)) {
-      clearSelection();
-    }
-  }
-  renderRowGroupTable(current);
-  renderMap();
-  updateMatchInfo();
+// ---------------------------------------------------------------------------
+// DOM helpers
+
+function el(tag: string, className = "", text?: string): HTMLElement {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
 }
 
-function cancelDraw() {
-  if (drawSession) {
-    drawSession.cancel();
-    drawSession = null;
-  }
-  suppressMapClick = false;
-  drawFilterBtn.textContent = "+ Rect";
-  drawFilterBtn.classList.remove("primary");
+function td(text: string, className = ""): HTMLTableCellElement {
+  return el("td", className, text) as HTMLTableCellElement;
 }
 
-function startDraw() {
-  if (!current) {
-    setStatus("Load a file before drawing a filter.", "error");
-    return;
-  }
-  if (drawSession) {
-    cancelDraw();
-    return;
-  }
-  drawFilterBtn.textContent = "Drawing… (Esc)";
-  drawFilterBtn.classList.add("primary");
-  suppressMapClick = true;
-  drawSession = startDrawRectangle(map, (b) => {
-    drawSession = null;
-    drawFilterBtn.textContent = "+ Rect";
-    drawFilterBtn.classList.remove("primary");
-    setTimeout(() => {
-      suppressMapClick = false;
-    }, 0);
-    if (b) setFilter(b);
-  });
+function tdTitled(text: string, className = ""): HTMLTableCellElement {
+  const cell = td(text, className);
+  cell.title = text;
+  return cell;
 }
 
-loadUrlBtn.addEventListener("click", () => {
-  void handleUrl();
+function swatch(color: string): HTMLElement {
+  const node = el("span", "swatch");
+  node.style.background = color;
+  return node;
+}
+
+function formatShare(part: number, total: number): string {
+  return `${formatBytes(part)} (${total > 0 ? ((part / total) * 100).toFixed(0) : 0}%)`;
+}
+
+function formatNumber(n: number): string {
+  if (!Number.isFinite(n)) return String(n);
+  const abs = Math.abs(n);
+  if (abs !== 0 && (abs < 1e-3 || abs >= 1e7)) return n.toExponential(3);
+  return n.toLocaleString(undefined, { maximumSignificantDigits: 5 });
+}
+
+// ---------------------------------------------------------------------------
+// Events
+
+let mapReady = false;
+map.on("load", () => {
+  mapReady = true;
+  refreshView();
 });
+map.on("moveend", () => {
+  if (current) refreshView();
+});
+
+onRowGroupClick(map, (indices, lngLat) => showCandidatePopup(lngLat, indices));
+onRowGroupHover(map, (index) => highlightRowGroup(index));
+
+viewModeEl.addEventListener("change", () => {
+  viewMode = viewModeEl.value as ViewMode;
+  refreshView();
+});
+levelSlider.addEventListener("input", () => {
+  selectedLevel = Number(levelSlider.value);
+  refreshView();
+});
+for (const button of tabButtons) {
+  button.addEventListener("click", () => setTab(button.dataset.tab as Tab));
+}
+clearSelBtn.addEventListener("click", () => clearSelection());
+
+loadUrlBtn.addEventListener("click", () => void handleUrl());
 urlInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") void handleUrl();
 });
@@ -1002,31 +1205,14 @@ window.addEventListener("drop", (e) => {
   const file = e.dataTransfer?.files?.[0];
   if (file) void handleFile(file);
 });
-toggleAllEl.addEventListener("change", () => {
-  setAllVisibility(toggleAllEl.checked);
-});
-showAllBtn.addEventListener("click", () => {
-  setAllVisibility(true);
-});
-hideAllBtn.addEventListener("click", () => {
-  setAllVisibility(false);
-});
-clearSelBtn.addEventListener("click", () => {
-  clearSelection();
-});
-drawFilterBtn.addEventListener("click", () => {
-  startDraw();
-});
-addColFilterBtn.addEventListener("click", () => {
-  addColumnFilter();
-});
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  if (drawSession) {
-    cancelDraw();
-  } else if (selectedIndex !== null) {
-    clearSelection();
-  } else if (filterRect) {
-    setFilter(null);
-  }
+  if (candidatePopup) closeCandidatePopup();
+  else if (selectedIndex !== null) clearSelection();
 });
+
+const initialUrl = new URLSearchParams(window.location.search).get("url");
+if (initialUrl) {
+  urlInput.value = initialUrl;
+  void handleUrl();
+}
